@@ -100,6 +100,7 @@ class SchedulerStatusResponse(BaseModel):
     today_executed: bool = False
     today_orders: list[OrderItem] = Field(default_factory=list)
     execution_log: list[str] = Field(default_factory=list)
+    log_total: int = 0
     account_info: Optional[AccountInfo] = None
     positions: list[PositionItem] = Field(default_factory=list)
     pending_sell_signals: list[PendingSellItem] = Field(default_factory=list)

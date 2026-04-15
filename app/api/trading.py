@@ -222,7 +222,7 @@ async def stop_scheduler() -> dict[str, Any]:
 
 
 @router.get("/api/trading/scheduler/status", response_model=SchedulerStatusResponse)
-async def get_scheduler_status() -> SchedulerStatusResponse:
+async def get_scheduler_status(log_offset: int = 0) -> SchedulerStatusResponse:
     scheduler = get_scheduler()
     s = scheduler.state
 
@@ -230,8 +230,21 @@ async def get_scheduler_status() -> SchedulerStatusResponse:
     new_logs = client.get_execution_log()
     if new_logs:
         s.execution_log.extend(new_logs)
+        s.log_seq += len(new_logs)
 
     from app.trading.models import PendingBuyItem, PendingSellItem
+
+    log_seq = s.log_seq
+    log_len = len(s.execution_log)
+    # log_seq 是累计写入总数，log_offset 是前端上次收到的 seq
+    # 列表可能被截断过，所以用 seq 差值而非列表索引做增量
+    unseen = log_seq - log_offset
+    if 0 < unseen <= log_len:
+        log_slice = s.execution_log[-unseen:]
+    elif unseen <= 0:
+        log_slice = []
+    else:
+        log_slice = s.execution_log
 
     pending_buy_items = [
         PendingBuyItem(ts_code=p.get("ts_code", ""), name=p.get("name", ""))
@@ -251,7 +264,8 @@ async def get_scheduler_status() -> SchedulerStatusResponse:
         next_execution=s.next_execution,
         today_executed=s.today_executed,
         today_orders=s.today_orders,
-        execution_log=s.execution_log,
+        execution_log=log_slice,
+        log_total=log_seq,
         account_info=s.account_info,
         positions=s.positions,
         pending_sell_signals=pending_sell_items,

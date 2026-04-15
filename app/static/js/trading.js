@@ -65,6 +65,9 @@
   let postCompleteTimer = null;
   let schedulerPollTimer = null;
   let shouldAutoScrollLog = true;
+  let logOffset = 0;
+  const MAX_LOG_DOM_NODES = 800;
+  const TRIM_LOG_DOM_TO = 500;
 
   // ── 工具 ──────────────────────────────────
 
@@ -214,7 +217,7 @@
 
   async function pollSchedulerStatus() {
     try {
-      const res = await fetch("/api/trading/scheduler/status");
+      const res = await fetch(`/api/trading/scheduler/status?log_offset=${logOffset}`);
       if (!res.ok) return;
       const s = await res.json();
       applySchedulerStatus(s);
@@ -229,7 +232,7 @@
 
   async function checkSchedulerStatus() {
     try {
-      const res = await fetch("/api/trading/scheduler/status");
+      const res = await fetch(`/api/trading/scheduler/status?log_offset=${logOffset}`);
       if (!res.ok) return;
       const s = await res.json();
       applySchedulerStatus(s);
@@ -246,7 +249,10 @@
     updateSchedulerStatusBar(s);
 
     if (s.execution_log && s.execution_log.length > 0) {
-      renderLog(s.execution_log);
+      appendLog(s.execution_log);
+    }
+    if (typeof s.log_total === "number") {
+      logOffset = s.log_total;
     }
     if (s.today_orders && s.today_orders.length > 0) {
       renderOrders(s.today_orders);
@@ -473,7 +479,7 @@
         runBtn.disabled = false;
         runBtn.textContent = "手动执行一次";
         if (job.status === "failed" && job.error) {
-          appendLog("错误: " + job.error);
+          appendLog(["错误: " + job.error]);
         }
         await refreshAccount();
         startPostCompletePolling(jobId);
@@ -606,19 +612,27 @@
 
   logEl.addEventListener("scroll", syncLogAutoScrollState);
 
-  function renderLog(logs) {
-    const previousScrollTop = logEl.scrollTop;
-    logEl.innerHTML = logs
-      .map((l) => {
-        const cls = getLogClass(l);
-        return `<p class="${cls}">${escHtml(l)}</p>`;
-      })
-      .join("");
+  function appendLog(newLines) {
+    const fragment = document.createDocumentFragment();
+    for (const l of newLines) {
+      const p = document.createElement("p");
+      p.className = getLogClass(l);
+      p.textContent = l;
+      fragment.appendChild(p);
+    }
+    logEl.appendChild(fragment);
+    // DOM 节点过多时截断最旧的
+    while (logEl.children.length > MAX_LOG_DOM_NODES) {
+      logEl.removeChild(logEl.firstChild);
+    }
     if (shouldAutoScrollLog) {
       logEl.scrollTop = logEl.scrollHeight;
-    } else {
-      logEl.scrollTop = previousScrollTop;
     }
+  }
+
+  function renderLog(logs) {
+    logEl.innerHTML = "";
+    appendLog(logs);
   }
 
   function getLogClass(line) {
@@ -635,17 +649,6 @@
     if (line.includes("已成")) return "log-success";
     if (line.includes("====")) return "log-separator";
     return "log-default";
-  }
-
-  function appendLog(msg) {
-    const wasAtBottom = shouldAutoScrollLog;
-    const p = document.createElement("p");
-    p.className = getLogClass(msg);
-    p.textContent = msg;
-    logEl.appendChild(p);
-    if (wasAtBottom) {
-      logEl.scrollTop = logEl.scrollHeight;
-    }
   }
 
   function resetResults() {
@@ -681,6 +684,31 @@
     const el = document.createElement("span");
     el.textContent = s;
     return el.innerHTML;
+  }
+
+  // ── 日志管理按钮 ──────────────────────────────
+
+  const saveLogBtn = document.getElementById("save-log-btn");
+  const clearLogBtn = document.getElementById("clear-log-btn");
+
+  if (saveLogBtn) {
+    saveLogBtn.addEventListener("click", () => {
+      const lines = Array.from(logEl.children).map((p) => p.textContent);
+      if (lines.length === 0) return;
+      const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      const today = new Date().toISOString().slice(0, 10);
+      a.download = `scheduler_log_${today}.txt`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+  }
+
+  if (clearLogBtn) {
+    clearLogBtn.addEventListener("click", () => {
+      logEl.innerHTML = "";
+    });
   }
 
   function truncate(s, maxLen) {

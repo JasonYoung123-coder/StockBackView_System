@@ -25,10 +25,10 @@ logger = logging.getLogger(__name__)
 
 SELL_EXECUTION_TIME = (14, 53)
 SELL_DEADLINE = (14, 59)
-SELL_SIGNAL_TIME = (21, 20)
-SELL_SIGNAL_DEADLINE = (21, 25)
-BUY_RECHECK_TIME = (23, 35)
-BUY_RECHECK_DEADLINE = (23, 40)
+SELL_SIGNAL_TIME = (21, 10)
+SELL_SIGNAL_DEADLINE = (21, 20)
+BUY_RECHECK_TIME = (21, 25)
+BUY_RECHECK_DEADLINE = (21, 35)
 OAMV_FETCH_TIME = (15, 5)
 OAMV_DEADLINE = (15, 15)
 BUY_SIGNAL_TIME = (15, 30)
@@ -39,11 +39,13 @@ BUY_PHASE1_TIME = (9, 25)
 BUY_PHASE2_TIME = (9, 30)
 MORNING_REPORT_TIME = (9, 35)
 SCHEDULER_WAKE = (9, 15)
-SCHEDULER_SLEEP = (23, 59)
+SCHEDULER_SLEEP = (22, 59)
 WEEKDAYS = {0, 1, 2, 3, 4}
 ORDER_RETRY_INTERVAL = 5
 SELL_MAX_RETRIES = 24
 BUY_MAX_RETRIES = 60
+MAX_MEMORY_LOG_LINES = 500
+LOG_DIR = Path(__file__).resolve().parents[2] / "data" / "logs"
 
 
 
@@ -65,6 +67,7 @@ class SchedulerState:
     last_execution: str = ""
     next_execution: str = ""
     execution_log: list[str] = field(default_factory=list)
+    log_seq: int = 0
     today_orders: list[OrderItem] = field(default_factory=list)
     today_executed: bool = False
     today_oamv_fetched: bool = False
@@ -167,7 +170,24 @@ class TradingScheduler:
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         with self._lock:
             self._state.execution_log.append(f"[{ts}] {msg}")
+            self._state.log_seq += 1
+            if len(self._state.execution_log) > MAX_MEMORY_LOG_LINES + 100:
+                self._flush_old_logs()
         logger.info(msg)
+
+    def _flush_old_logs(self) -> None:
+        """将超出上限的旧日志写入文件，保留最近 MAX_MEMORY_LOG_LINES 条。"""
+        overflow = self._state.execution_log[:-MAX_MEMORY_LOG_LINES]
+        self._state.execution_log = self._state.execution_log[-MAX_MEMORY_LOG_LINES:]
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            today = datetime.date.today().strftime("%Y-%m-%d")
+            log_file = LOG_DIR / f"scheduler_{today}.log"
+            with open(log_file, "a", encoding="utf-8") as f:
+                for line in overflow:
+                    f.write(line + "\n")
+        except Exception as exc:
+            logger.warning("日志写入文件失败: %s", exc)
 
     def start(self, config: SchedulerConfig) -> None:
         with self._lock:
@@ -777,8 +797,22 @@ class TradingScheduler:
                                 client.cancel_order(old_id)
                             except Exception as exc:
                                 self._log(f"  撤单异常 {ts_code} order_id={old_id}: {exc}")
-                            self._log(f"  撤单 {ts_code} order_id={old_id}，剩余 {remaining}股")
                             time.sleep(1)
+                            # 撤单后重新查询老委托的最终成交量
+                            post_cancel = client.get_order_detail(old_id)
+                            if post_cancel is not None:
+                                final_traded = int(post_cancel.get("traded_volume", 0))
+                                if final_traded > 0:
+                                    newly_filled = max(final_traded - (int(info["volume"]) - remaining), 0)
+                                    remaining = max(remaining - newly_filled, 0)
+                                    info = {**info,
+                                            "remaining": remaining,
+                                            "total_traded": int(info.get("total_traded", 0)) + newly_filled}
+                            self._log(f"  撤单 {ts_code} order_id={old_id}，剩余 {remaining}股")
+
+                        if remaining <= 0:
+                            self._log(f"  {ts_code} {info['name']} 卖出已全部成交（撤单后确认）")
+                            continue
 
                         new_price = client.get_latest_price(ts_code)
                         price_label = f"@{new_price:.2f}" if new_price else "@最新价"
@@ -1218,8 +1252,21 @@ class TradingScheduler:
                     client.cancel_order(old_id)
                 except Exception as exc:
                     self._log(f"  撤单异常 {ts_code} order_id={old_id}: {exc}")
-                self._log(f"  撤单 {ts_code} order_id={old_id}，剩余 {remaining}股")
                 time.sleep(1)
+                # 撤单后重新查询老委托的最终成交量
+                post_cancel = client.get_order_detail(old_id)
+                if post_cancel is not None:
+                    final_traded = int(post_cancel.get("traded_volume", 0))
+                    if final_traded > 0:
+                        newly_filled = max(final_traded - (int(info["volume"]) - remaining), 0)
+                        remaining = max(remaining - newly_filled, 0)
+                        info = {**info, "remaining": remaining}
+                self._log(f"  撤单 {ts_code} order_id={old_id}，剩余 {remaining}股")
+
+                if remaining <= 0:
+                    self._log(f"  {ts_code} {info['name']} 卖出已全部成交（撤单后确认）")
+                    active_orders[ts_code] = {**info, "order_id": old_id, "remaining": 0}
+                    continue
 
                 new_price = client.get_latest_price(ts_code)
                 price_label = f"@{new_price:.2f}" if new_price else "@最新价"
@@ -1457,8 +1504,21 @@ class TradingScheduler:
                     client.cancel_order(old_id)
                 except Exception as exc:
                     self._log(f"  撤单异常 {ts_code} order_id={old_id}: {exc}")
-                self._log(f"  撤单 {ts_code} order_id={old_id}，剩余 {remaining}股")
                 time.sleep(1)
+                # 撤单后重新查询老委托的最终成交量
+                post_cancel = client.get_order_detail(old_id)
+                if post_cancel is not None:
+                    final_traded = int(post_cancel.get("traded_volume", 0))
+                    if final_traded > 0:
+                        newly_filled = max(final_traded - (int(info["volume"]) - remaining), 0)
+                        remaining = max(remaining - newly_filled, 0)
+                        info = {**info, "remaining": remaining}
+                self._log(f"  撤单 {ts_code} order_id={old_id}，剩余 {remaining}股")
+
+                if remaining <= 0:
+                    self._log(f"  {ts_code} {info['name']} 买入已全部成交（撤单后确认）")
+                    active_orders[ts_code] = {**info, "order_id": old_id, "remaining": 0}
+                    continue
 
                 new_price = client.get_latest_price(ts_code)
                 price_label = f"@{new_price:.2f}" if new_price else "@最新价"
@@ -1551,6 +1611,17 @@ class TradingScheduler:
                 except Exception:
                     pass
                 time.sleep(1)
+                # 撤单后重新查询最终成交量
+                post_cancel = client.get_order_detail(order_id)
+                if post_cancel is not None:
+                    final_traded = int(post_cancel.get("traded_volume", 0))
+                    extra = final_traded - traded
+                    if extra > 0:
+                        total_traded += extra
+                        remaining -= extra
+                        if remaining <= 0:
+                            self._log(f"    全部成交（撤单后确认，共 {total_traded}股）")
+                            return True, total_traded
             else:
                 self._log(f"    无法查询委托状态，撤单重新委托")
                 try:
@@ -1574,6 +1645,9 @@ class TradingScheduler:
         if new_logs:
             with self._lock:
                 self._state.execution_log.extend(new_logs)
+                self._state.log_seq += len(new_logs)
+                if len(self._state.execution_log) > MAX_MEMORY_LOG_LINES + 100:
+                    self._flush_old_logs()
 
     # ────────────── OAMV 事件持久化 ──────────────
 
