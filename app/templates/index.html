@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>劲帆交易回测系统</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=5" />
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero-card">
+        <div>
+          <p class="eyebrow">Quant Research Console</p>
+          <h1>劲帆交易回测系统</h1>
+          <p class="hero-copy">面向 A 股策略研究的组合回测工作台，集成策略参数、进度追踪、收益对比与逐笔交易复盘。</p>
+        </div>
+        <div class="hero-badge {% if config_ready %}success{% else %}warning{% endif %}">
+          {% if config_ready %}
+          已检测到本地 Tushare Token
+          {% else %}
+          请先配置 <code>{{ config_path }}</code>
+          {% endif %}
+        </div>
+      </section>
+
+      <nav class="tab-bar">
+        <button class="tab active" data-tab="backtest">策略回测</button>
+        <button class="tab" data-tab="trading">实盘交易</button>
+      </nav>
+
+      <section class="content-grid" data-tab-content="backtest">
+        <section class="panel form-panel">
+          <div class="panel-head panel-head-stack">
+            <h2>回测参数</h2>
+            <div class="panel-head-meta">
+              <span id="status" class="muted">正在加载策略列表...</span>
+              <div id="job-meta-wrap" class="job-meta-wrap"></div>
+            </div>
+          </div>
+
+          <form id="backtest-form" class="form-grid">
+            <div class="parameter-grid">
+              <label>
+                策略
+                <select name="strategy_name" id="strategy-select" required></select>
+              </label>
+              <label>
+                开始日期
+                <input name="start_date" type="date" value="2023-01-01" required />
+              </label>
+              <label>
+                结束日期
+                <input name="end_date" type="date" value="2024-12-31" required />
+              </label>
+              <label>
+                初始资金
+                <input name="initial_capital" type="number" value="100000" min="1" step="1" required />
+              </label>
+              <label>
+                手续费率
+                <input name="commission_rate" type="number" value="0.0003" min="0" step="0.0001" />
+              </label>
+              <label>
+                印花税率
+                <input name="stamp_duty_rate" type="number" value="0.001" min="0" step="0.0001" />
+              </label>
+            </div>
+
+            <div id="strategy-params-panel" class="strategy-params hidden">
+              <div class="subsection-head">
+                <h3>策略自由参数</h3>
+                <span class="muted" id="strategy-params-hint">当前策略无额外参数</span>
+              </div>
+              <div id="strategy-params-fields" class="params-grid"></div>
+            </div>
+
+            <div class="form-actions">
+              <button id="submit-button" type="submit">开始回测</button>
+            </div>
+
+            <div class="panel-foot muted">
+              策略目录：<code>{{ strategies_dir }}</code>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel result-panel">
+          <div class="panel-head">
+            <h2>回测结果</h2>
+          </div>
+
+          <div id="progress-container" class="progress-container hidden">
+            <div class="progress-meta">
+              <span id="progress-message">正在准备回测...</span>
+              <span id="progress-percent">0%</span>
+            </div>
+            <div class="progress-track">
+              <div id="progress-bar" class="progress-bar"></div>
+            </div>
+          </div>
+
+          <!-- 回测前引导占位 -->
+          <div id="backtest-placeholder" class="backtest-placeholder">
+            <div class="placeholder-icon">📊</div>
+            <h3>策略回测工作台</h3>
+            <p>在左侧配置好回测参数后，点击「开始回测」即可运行。</p>
+            <div class="placeholder-steps">
+              <div class="placeholder-step">
+                <span class="step-num">1</span>
+                <span>选择策略并设定回测日期区间</span>
+              </div>
+              <div class="placeholder-step">
+                <span class="step-num">2</span>
+                <span>配置初始资金、手续费等参数</span>
+              </div>
+              <div class="placeholder-step">
+                <span class="step-num">3</span>
+                <span>回测完成后查看收益曲线、持仓详情和逐笔交易</span>
+              </div>
+            </div>
+          </div>
+
+          <div id="metrics" class="metrics metrics-performance"></div>
+          <div class="summary-row">
+            <div id="signal-summary" class="summary-column"></div>
+            <div id="trade-summary" class="summary-column"></div>
+          </div>
+          <div id="chart" class="chart hidden"></div>
+        </section>
+
+        <div id="daily-detail-float" class="daily-detail-sidebar hidden">
+          <div class="float-head">
+            <h4 id="daily-detail-title">持仓详情</h4>
+            <span id="daily-holdings-count" class="muted"></span>
+          </div>
+          <div id="daily-overview" class="float-overview"></div>
+          <div id="daily-holdings" class="float-holdings"></div>
+        </div>
+      </section>
+
+      <section class="panel trade-panel" data-tab-content="backtest">
+        <div class="table-header">
+          <h2>逐笔交易记录</h2>
+          <span id="trade-count" class="muted">暂无数据</span>
+        </div>
+        <div class="table-wrapper">
+          <table class="trade-table" id="trade-table">
+            <thead>
+              <tr>
+                <th data-sort-key="trade_no">序号</th>
+                <th data-sort-key="trade_type">交易类型</th>
+                <th data-sort-disabled="true">股票</th>
+                <th data-sort-key="buy_date">买入日期</th>
+                <th data-sort-key="sell_date">卖出日期</th>
+                <th data-sort-key="sell_reason">交易说明</th>
+                <th data-sort-key="buy_price">买入价</th>
+                <th data-sort-key="sell_price">卖出价</th>
+                <th data-sort-key="position_weight">仓位</th>
+                <th data-sort-key="buy_amount">买入金额</th>
+                <th data-sort-key="sell_amount">卖出金额</th>
+                <th data-sort-key="pnl_amount">收益金额</th>
+                <th data-sort-key="return_rate">收益率</th>
+                <th data-sort-key="holding_days">持有天数</th>
+              </tr>
+            </thead>
+            <tbody id="trade-records-body">
+              <tr>
+                <td colspan="14" class="muted empty-cell">回测完成后将在这里显示逐笔交易。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ═══════ 实盘交易 Tab ═══════ -->
+      <section class="trading-grid hidden" data-tab-content="trading">
+        <!-- 左栏：连接 & 策略 & 账户 -->
+        <section class="panel trading-form-panel">
+          <div class="panel-head panel-head-stack">
+            <h2>实盘交易</h2>
+            <div class="panel-head-meta">
+              <span id="qmt-status" class="qmt-status disconnected">未连接</span>
+            </div>
+          </div>
+
+          <div class="form-grid">
+            <div class="subsection-head"><h3>QMT 连接</h3></div>
+            <div class="form-actions" style="gap:8px;">
+              <button id="qmt-connect-btn" type="button" class="btn-primary">连接 QMT</button>
+              <button id="qmt-disconnect-btn" type="button" class="btn-secondary" disabled>断开</button>
+            </div>
+
+            <div class="subsection-head" style="margin-top:16px;"><h3>策略配置</h3></div>
+            <div class="parameter-grid">
+              <label>
+                策略
+                <select id="trading-strategy-select" required></select>
+              </label>
+              <label>
+                下单方式
+                <select id="trading-price-type">
+                  <option value="latest">最新价</option>
+                  <option value="limit">限价（当前价）</option>
+                </select>
+              </label>
+              <label>
+                回看天数
+                <input id="trading-lookback" type="number" value="250" min="30" step="1" />
+              </label>
+              <label>
+                实盘起始日
+                <input id="trading-live-start" type="date" />
+              </label>
+            </div>
+
+            <!-- 资金比例 -->
+            <div class="subsection-head" style="margin-top:12px;"><h3>资金比例</h3></div>
+            <div class="fund-ratio-bar">
+              <label class="ratio-option"><input type="radio" name="fund-ratio" value="0.2" /><span>20%</span></label>
+              <label class="ratio-option"><input type="radio" name="fund-ratio" value="0.4" /><span>40%</span></label>
+              <label class="ratio-option"><input type="radio" name="fund-ratio" value="0.6" /><span>60%</span></label>
+              <label class="ratio-option"><input type="radio" name="fund-ratio" value="0.8" /><span>80%</span></label>
+              <label class="ratio-option"><input type="radio" name="fund-ratio" value="1.0" checked /><span>100%</span></label>
+            </div>
+
+            <!-- 交易开关 -->
+            <div class="subsection-head" style="margin-top:12px;"><h3>交易控制</h3></div>
+            <div class="toggle-group">
+              <label class="toggle-label">
+                <input id="toggle-buy-existing" type="checkbox" />
+                <span>买入策略已持仓的股票</span>
+                <span class="toggle-hint">（默认关闭：仅买入新增股票）</span>
+              </label>
+              <label class="toggle-label">
+                <input id="toggle-allow-sell" type="checkbox" checked />
+                <span>自动卖出持仓</span>
+                <span class="toggle-hint">（开启后策略会自动卖出符合条件的持仓）</span>
+              </label>
+            </div>
+
+            <!-- 操作按钮 -->
+            <div class="form-actions trading-action-row" style="margin-top:12px;gap:8px;">
+              <button id="scheduler-start-btn" type="button" class="btn-primary" disabled>开启策略</button>
+              <button id="scheduler-stop-btn" type="button" class="btn-secondary" disabled>关闭策略</button>
+              <button id="trading-run-btn" type="button" class="btn-secondary trading-manual-btn" disabled style="font-size:12px;">手动执行一次</button>
+            </div>
+            <div id="scheduler-status-bar" class="scheduler-status-bar hidden">
+              <span id="scheduler-status-text"></span>
+            </div>
+          </div>
+
+          <!-- 账户概览 -->
+          <div id="trading-account-panel" class="trading-account-panel hidden">
+            <div class="subsection-head"><h3>账户概览</h3></div>
+            <div id="trading-account-info" class="trading-account-info"></div>
+            <div class="subsection-head" style="margin-top:12px;"><h3>当前持仓</h3></div>
+            <div class="table-wrapper positions-table-wrapper" style="max-height:280px;">
+              <table class="trade-table compact positions-table">
+                <thead>
+                  <tr><th>代码</th><th>可用/持仓</th><th>成本</th><th>市值</th><th>盈亏</th><th>盈亏率</th></tr>
+                </thead>
+                <tbody id="trading-positions-body">
+                  <tr><td colspan="6" class="muted empty-cell">连接后显示</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- 右栏：订单 & 日志 -->
+        <section class="panel trading-result-panel">
+          <div class="panel-head"><h2>执行结果</h2></div>
+
+          <div id="trading-progress" class="progress-container hidden">
+            <div class="progress-meta">
+              <span id="trading-progress-msg">准备中...</span>
+              <span id="trading-progress-pct">0%</span>
+            </div>
+            <div class="progress-track">
+              <div id="trading-progress-bar" class="progress-bar"></div>
+            </div>
+          </div>
+
+          <!-- 待卖出标的 -->
+          <div id="pending-sells-section" class="hidden" style="margin-bottom:12px;">
+            <div class="subsection-head">
+              <h3>待卖出标的</h3>
+              <span id="pending-sells-count" class="muted"></span>
+              <span class="muted" style="margin-left:8px;font-size:11px;">（盘后补检，将于下一交易日 9:26 委托卖出）</span>
+            </div>
+            <div class="table-wrapper" style="max-height:200px;">
+              <table class="trade-table compact">
+                <thead>
+                  <tr><th>代码</th><th>名称</th><th>卖出原因</th></tr>
+                </thead>
+                <tbody id="pending-sells-body">
+                  <tr><td colspan="3" class="muted empty-cell">暂无待卖出标的</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 待买入标的 -->
+          <div id="pending-buys-section" class="hidden" style="margin-bottom:12px;">
+            <div class="subsection-head">
+              <h3>待买入标的</h3>
+              <span id="pending-buys-count" class="muted"></span>
+              <span class="muted" style="margin-left:8px;font-size:11px;">（将于下一交易日 9:26 委托）</span>
+            </div>
+            <div class="table-wrapper" style="max-height:200px;">
+              <table class="trade-table compact">
+                <thead>
+                  <tr><th>代码</th><th>名称</th></tr>
+                </thead>
+                <tbody id="pending-buys-body">
+                  <tr><td colspan="2" class="muted empty-cell">暂无待买入标的</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="subsection-head">
+            <h3>订单列表</h3>
+            <span id="trading-order-count" class="muted"></span>
+            <button id="qmt-query-orders-btn" class="btn-secondary" style="margin-left:auto;padding:3px 10px;font-size:12px;" disabled>查询QMT委托</button>
+          </div>
+          <div class="table-wrapper" style="max-height:320px;">
+            <table class="trade-table compact">
+              <thead>
+                <tr>
+                  <th>代码</th><th>名称</th><th>方向</th><th>数量</th>
+                  <th>价格</th><th>金额</th><th>方式</th><th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="trading-orders-body">
+                <tr><td colspan="8" class="muted empty-cell">执行后显示订单</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- QMT 委托记录 -->
+          <div id="qmt-orders-section" class="hidden" style="margin-top:12px;">
+            <div class="subsection-head"><h3>QMT 委托记录</h3><span id="qmt-order-count" class="muted"></span></div>
+            <div class="table-wrapper" style="max-height:280px;">
+              <table class="trade-table compact">
+                <thead>
+                  <tr>
+                    <th>代码</th><th>方向</th><th>委托量</th><th>委托价</th>
+                    <th>已成量</th><th>成交价</th><th>状态</th><th>说明</th>
+                  </tr>
+                </thead>
+                <tbody id="qmt-orders-body">
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="subsection-head" style="margin-top:16px;">
+            <h3>执行日志</h3>
+            <button id="qmt-refresh-log-btn" class="btn-secondary" style="margin-left:auto;padding:3px 10px;font-size:12px;" disabled>刷新日志</button>
+          </div>
+          <div id="trading-log" class="execution-log">
+            <p class="muted">等待执行...</p>
+          </div>
+        </section>
+      </section>
+
+    </main>
+
+    <script src="/static/js/backtest.js?v=5"></script>
+    <script src="/static/js/trading.js?v=7"></script>
+  </body>
+</html>

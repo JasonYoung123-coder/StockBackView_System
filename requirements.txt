@@ -1,0 +1,36 @@
+# ═══════════════════════════════════════════
+#  StockBackView System 1.0.1 - Python 依赖
+#  Python >= 3.9
+# ═══════════════════════════════════════════
+
+# Web 框架 & 服务器
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+jinja2>=3.1.0
+python-multipart>=0.0.6
+
+# 数据处理
+pandas>=1.5.0
+numpy>=1.23.0
+openpyxl>=3.0.0
+
+# 数据模型
+pydantic>=2.0.0
+
+# 金融数据
+tushare>=1.4.0
+
+# 网络请求
+requests>=2.28.0
+
+# XML/HTML 解析 (tushare 依赖)
+lxml>=4.9.0
+
+# XML 安全解析 (openpyxl 依赖，防止 QMT 旧版 defusedxml 冲突)
+defusedxml>=0.7.0
+
+# TOML 配置解析 (Python < 3.11 需要)
+tomli>=2.0.0;python_version<"3.11"
+
+# 图像处理 (K线图像分析，可选)
+Pillow>=9.0.0

@@ -1,0 +1,27 @@
+[tushare]
+token = "your_tushare_token_here"
+
+[data]
+dir = "data"
+cache_dir = "cache"
+
+[strategy]
+dir = "strategies"
+
+[backtest]
+default_commission_rate = 0.0003
+default_stamp_duty_rate = 0.001
+
+[feishu]
+# 飞书自建应用凭证，用于实盘信号通知
+app_id = ""
+app_secret = ""
+# 私聊的聊天 ID（chat_id），可通过飞书 API 获取
+chat_id = ""
+# 是否启用飞书通知（false 则完全不发送）
+enabled = true
+
+[benchmarks]
+"上证指数" = "000001.SH"
+"沪深300" = "000300.SH"
+"中证1000" = "000852.SH"
