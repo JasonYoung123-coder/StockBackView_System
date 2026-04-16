@@ -27,16 +27,16 @@ SELL_EXECUTION_TIME = (14, 53)
 SELL_DEADLINE = (14, 59)
 SELL_SIGNAL_TIME = (21, 10)
 SELL_SIGNAL_DEADLINE = (21, 20)
-BUY_RECHECK_TIME = (21, 25)
-BUY_RECHECK_DEADLINE = (21, 35)
+BUY_SIGNAL_TIME = (21, 25)
+BUY_SIGNAL_DEADLINE = (21, 35)
 OAMV_FETCH_TIME = (15, 5)
 OAMV_DEADLINE = (15, 15)
-BUY_SIGNAL_TIME = (15, 30)
-BUY_SIGNAL_DEADLINE = (15, 45)
 SELL_PHASE1_TIME = (9, 25)
 SELL_PHASE2_TIME = (9, 30)
+SELL_MORNING_DEADLINE = (9, 35)
 BUY_PHASE1_TIME = (9, 25)
 BUY_PHASE2_TIME = (9, 30)
+BUY_MORNING_DEADLINE = (9, 35)
 MORNING_REPORT_TIME = (9, 35)
 SCHEDULER_WAKE = (9, 15)
 SCHEDULER_SLEEP = (22, 59)
@@ -83,8 +83,6 @@ class SchedulerState:
     buy_execution_date: str = ""
     today_buy_signals_generated: bool = False
     last_buy_signal_gen: str = ""
-    today_buy_recheck_generated: bool = False
-    last_buy_recheck_gen: str = ""
     strategy_target_holdings: int = 0
     strategy_holding_codes: list = field(default_factory=list)
     today_morning_report_sent: bool = False
@@ -123,6 +121,10 @@ class TradingScheduler:
                 "pending_buy_signals": list(self._state.pending_buy_signals),
                 "strategy_target_holdings": self._state.strategy_target_holdings,
                 "strategy_holding_codes": list(self._state.strategy_holding_codes),
+                "buy_execution_date": self._state.buy_execution_date,
+                "sell_signal_execution_date": self._state.sell_signal_execution_date,
+                "today_executed": self._state.today_executed,
+                "last_execution": self._state.last_execution,
                 "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
         try:
@@ -135,7 +137,7 @@ class TradingScheduler:
             logger.warning("保存 pending 信号失败: %s", exc)
 
     def _load_pending_signals(self) -> None:
-        """从本地 JSON 恢复 pending 信号（启动时调用）。"""
+        """从本地 JSON 恢复 pending 信号和执行标记（启动时调用）。"""
         path = self._pending_file_path()
         if not path.exists():
             return
@@ -143,13 +145,21 @@ class TradingScheduler:
             data = json.loads(path.read_text(encoding="utf-8"))
             sells = data.get("pending_sell_signals", [])
             buys = data.get("pending_buy_signals", [])
-            if sells or buys:
-                with self._lock:
+            with self._lock:
+                if sells or buys:
                     self._state.pending_sell_signals = sells
                     self._state.pending_buy_signals = buys
                     self._state.strategy_target_holdings = int(data.get("strategy_target_holdings", 0))
                     self._state.strategy_holding_codes = list(data.get("strategy_holding_codes", []))
-                updated = data.get("updated_at", "未知")
+                if data.get("buy_execution_date"):
+                    self._state.buy_execution_date = data["buy_execution_date"]
+                if data.get("sell_signal_execution_date"):
+                    self._state.sell_signal_execution_date = data["sell_signal_execution_date"]
+                if data.get("today_executed"):
+                    self._state.today_executed = True
+                    self._state.last_execution = data.get("last_execution", "")
+            updated = data.get("updated_at", "未知")
+            if sells or buys:
                 self._log(f"从本地恢复 pending 信号（{updated}）: "
                            f"待卖出 {len(sells)} 只, 待买入 {len(buys)} 只")
         except Exception as exc:
@@ -278,20 +288,16 @@ class TradingScheduler:
                 self._state.today_buy_signals_generated
                 and self._state.last_buy_signal_gen.startswith(today_str)
             )
-            buy_recheck_generated = (
-                self._state.today_buy_recheck_generated
-                and self._state.last_buy_recheck_gen.startswith(today_str)
-            )
 
         with self._lock:
             morning_report_sent = self._state.today_morning_report_sent
             afternoon_report_sent = self._state.today_afternoon_report_sent
 
         # ── 早盘：先卖出（释放资金），再买入 ──
-        if has_pending_sells and not sells_exec_done and hm >= SELL_PHASE1_TIME:
+        if has_pending_sells and not sells_exec_done and SELL_PHASE1_TIME <= hm <= SELL_MORNING_DEADLINE:
             self._execute_pending_sells(now)
 
-        if has_pending_buys and not buys_done_today and hm >= BUY_PHASE1_TIME:
+        if has_pending_buys and not buys_done_today and BUY_PHASE1_TIME <= hm <= BUY_MORNING_DEADLINE:
             self._execute_pending_buys(now)
 
         if not morning_report_sent and hm >= MORNING_REPORT_TIME:
@@ -299,28 +305,10 @@ class TradingScheduler:
             with self._lock:
                 self._state.today_morning_report_sent = True
 
-        if not already_executed and hm >= SELL_EXECUTION_TIME:
+        if not already_executed and SELL_EXECUTION_TIME <= hm <= SELL_DEADLINE:
             self._execute_sell_phase(now)
 
-        # ── 盘后：卖出信号补检 → 买入信号补检 → OAMV → 买入信号 ──
-        if not sell_sigs_generated and hm >= SELL_SIGNAL_TIME:
-            if hm < SELL_SIGNAL_DEADLINE:
-                self._generate_sell_signals(now)
-            else:
-                self._log(f"卖出信号补检窗口已关闭 ({SELL_SIGNAL_DEADLINE[0]:02d}:{SELL_SIGNAL_DEADLINE[1]:02d})，跳过")
-                with self._lock:
-                    self._state.today_sell_signals_generated = True
-                    self._state.last_sell_signal_gen = now.strftime("%Y-%m-%d %H:%M:%S")
-
-        if not buy_recheck_generated and hm >= BUY_RECHECK_TIME:
-            if hm < BUY_RECHECK_DEADLINE:
-                self._generate_buy_recheck_signals(now)
-            else:
-                self._log(f"买入信号补检窗口已关闭 ({BUY_RECHECK_DEADLINE[0]:02d}:{BUY_RECHECK_DEADLINE[1]:02d})，跳过")
-                with self._lock:
-                    self._state.today_buy_recheck_generated = True
-                    self._state.last_buy_recheck_gen = now.strftime("%Y-%m-%d %H:%M:%S")
-
+        # ── 盘后：OAMV → 卖出信号生成 → 买入信号生成 ──
         if not oamv_fetched and hm >= OAMV_FETCH_TIME:
             if hm < OAMV_DEADLINE:
                 self._fetch_oamv_daily(now)
@@ -330,11 +318,20 @@ class TradingScheduler:
                     self._state.today_oamv_fetched = True
                     self._state.last_oamv_fetch = now.strftime("%Y-%m-%d %H:%M:%S")
 
+        if not sell_sigs_generated and hm >= SELL_SIGNAL_TIME:
+            if hm < SELL_SIGNAL_DEADLINE:
+                self._generate_sell_signals(now)
+            else:
+                self._log(f"卖出信号生成窗口已关闭 ({SELL_SIGNAL_DEADLINE[0]:02d}:{SELL_SIGNAL_DEADLINE[1]:02d})，跳过")
+                with self._lock:
+                    self._state.today_sell_signals_generated = True
+                    self._state.last_sell_signal_gen = now.strftime("%Y-%m-%d %H:%M:%S")
+
         if not buy_sigs_generated and hm >= BUY_SIGNAL_TIME:
             if hm < BUY_SIGNAL_DEADLINE:
                 self._generate_buy_signals(now)
             else:
-                self._log(f"买入信号生成窗口已关闭 ({BUY_SIGNAL_DEADLINE[0]:02d}:{BUY_SIGNAL_DEADLINE[1]:02d})，跳过本日生成")
+                self._log(f"买入信号生成窗口已关闭 ({BUY_SIGNAL_DEADLINE[0]:02d}:{BUY_SIGNAL_DEADLINE[1]:02d})，跳过")
                 with self._lock:
                     self._state.today_buy_signals_generated = True
                     self._state.last_buy_signal_gen = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -354,10 +351,6 @@ class TradingScheduler:
             sell_sigs_done = (
                 self._state.today_sell_signals_generated
                 and self._state.last_sell_signal_gen.startswith(today_str)
-            )
-            buy_recheck_done = (
-                self._state.today_buy_recheck_generated
-                and self._state.last_buy_recheck_gen.startswith(today_str)
             )
             oamv_done = self._state.today_oamv_fetched and self._state.last_oamv_fetch.startswith(today_str)
             buy_sigs_done = (
@@ -386,27 +379,20 @@ class TradingScheduler:
                         now.date(), datetime.time(*SELL_EXECUTION_TIME),
                     ).strftime("%Y-%m-%d %H:%M 盘中卖出")
                 return
-            # 盘后：卖出补检 → 买入补检 → OAMV → 买入信号
-            if not sell_sigs_done and hm < SELL_SIGNAL_DEADLINE:
-                with self._lock:
-                    next_t = SELL_SIGNAL_TIME if hm < SELL_SIGNAL_TIME else (hm[0], hm[1] + 1)
-                    self._state.next_execution = datetime.datetime.combine(
-                        now.date(), datetime.time(*next_t),
-                    ).strftime("%Y-%m-%d %H:%M 卖出补检")
-                return
-            if not buy_recheck_done and hm < BUY_RECHECK_DEADLINE:
-                with self._lock:
-                    next_t = BUY_RECHECK_TIME if hm < BUY_RECHECK_TIME else (hm[0], hm[1] + 1)
-                    self._state.next_execution = datetime.datetime.combine(
-                        now.date(), datetime.time(*next_t),
-                    ).strftime("%Y-%m-%d %H:%M 买入补检")
-                return
+            # 盘后：OAMV → 卖出信号 → 买入信号
             if not oamv_done and hm < OAMV_DEADLINE:
                 with self._lock:
                     next_t = OAMV_FETCH_TIME if hm < OAMV_FETCH_TIME else (hm[0], hm[1] + 1)
                     self._state.next_execution = datetime.datetime.combine(
                         now.date(), datetime.time(*next_t),
                     ).strftime("%Y-%m-%d %H:%M OAMV拉取")
+                return
+            if not sell_sigs_done and hm < SELL_SIGNAL_DEADLINE:
+                with self._lock:
+                    next_t = SELL_SIGNAL_TIME if hm < SELL_SIGNAL_TIME else (hm[0], hm[1] + 1)
+                    self._state.next_execution = datetime.datetime.combine(
+                        now.date(), datetime.time(*next_t),
+                    ).strftime("%Y-%m-%d %H:%M 卖出信号")
                 return
             if not buy_sigs_done and hm < BUY_SIGNAL_DEADLINE:
                 with self._lock:
@@ -417,7 +403,7 @@ class TradingScheduler:
                 return
 
         target_date = now.date()
-        if skip_today or hm >= BUY_RECHECK_DEADLINE:
+        if skip_today or hm >= BUY_SIGNAL_DEADLINE:
             target_date += datetime.timedelta(days=1)
         while target_date.weekday() not in WEEKDAYS:
             target_date += datetime.timedelta(days=1)
@@ -871,20 +857,94 @@ class TradingScheduler:
             self._state.today_orders = sell_orders
             self._state.today_executed = True
             self._state.last_execution = now.strftime("%Y-%m-%d %H:%M:%S")
+        self._save_pending_signals()
         if sell_orders:
             self._notify_execution_result("盘中卖出", sell_orders)
-        self._log(f"卖出阶段完毕，盘后卖出补检将于 {SELL_SIGNAL_TIME[0]:02d}:{SELL_SIGNAL_TIME[1]:02d} 执行")
+        self._log(f"卖出阶段完毕，盘后卖出信号生成将于 {SELL_SIGNAL_TIME[0]:02d}:{SELL_SIGNAL_TIME[1]:02d} 执行")
 
-    # ────────────── 15:30 买入信号生成 ──────────────
+    # ────────────── 21:10 盘后卖出信号生成 ──────────────
 
-    def _generate_buy_signals(self, now: datetime.datetime) -> None:
-        """19:05~19:30 运行策略生成买入信号，保存为待买入标的（T+1 日 9:26 执行）。
+    def _generate_sell_signals(self, now: datetime.datetime) -> None:
+        """21:10~21:20 用完整日线+筹码数据重跑策略，生成卖出信号。
 
-        优先使用 Tushare 日线（收盘后已就绪），若当日日线缺失则 fallback 到实时行情。
+        逻辑：
+        1. 以完整日线（含当日收盘）重跑策略，获取全量卖出信号。
+        2. 排除 14:53 已经成功执行的卖出（today_orders）。
+        3. 剩余的即为"遗漏卖出"（含筹码止盈 + 死叉次日卖出等），
+           存入 pending_sell_signals，次日 9:26 执行。
         """
         config = self._state.config
         self._log("=" * 50)
-        self._log(f"─── {BUY_SIGNAL_TIME[0]:02d}:{BUY_SIGNAL_TIME[1]:02d} 买入信号生成: {config.strategy_name} ───")
+        self._log(f"─── {SELL_SIGNAL_TIME[0]:02d}:{SELL_SIGNAL_TIME[1]:02d} "
+                  f"盘后卖出信号生成: {config.strategy_name} ───")
+
+        result = self._run_strategy_core()
+        if result is None:
+            with self._lock:
+                self._state.today_sell_signals_generated = True
+                self._state.last_sell_signal_gen = now.strftime("%Y-%m-%d %H:%M:%S")
+            return
+
+        sell_signals = result["sell_signals"]
+        held_codes = result["held_codes"]
+        name_map = result["name_map"]
+
+        with self._lock:
+            already_sold = {o.ts_code for o in self._state.today_orders if o.direction == "sell"}
+
+        if sell_signals:
+            pending: list[dict] = []
+            for sig in sell_signals:
+                ts_code = sig["ts_code"]
+                if ts_code in already_sold:
+                    self._log(f"  {ts_code}: 盘中已卖出，跳过")
+                    continue
+                if ts_code not in held_codes:
+                    self._log(f"  {ts_code}: QMT 无持仓，跳过")
+                    continue
+                reason = sig.get("reason", "策略卖出")
+                pending.append({
+                    "ts_code": ts_code,
+                    "name": name_map.get(ts_code, ""),
+                    "reason": reason,
+                })
+            if pending:
+                with self._lock:
+                    self._state.pending_sell_signals = pending
+                self._save_pending_signals()
+                self._log(f"发现 {len(pending)} 只遗漏卖出，将于下一交易日 9:26 委托卖出")
+                for p in pending:
+                    self._log(f"  待卖出: {p['ts_code']} {p['name']} ({p['reason']})")
+                self._notify_sell_signals(pending)
+            else:
+                self._log("卖出信号扫描完成，无遗漏卖出信号")
+                self._notify_no_sell_signal(len(already_sold))
+        else:
+            self._log("卖出信号扫描完成，策略无卖出信号")
+            with self._lock:
+                already_sold_count = sum(1 for o in self._state.today_orders if o.direction == "sell")
+            self._notify_no_sell_signal(already_sold_count)
+
+        with self._lock:
+            self._state.today_sell_signals_generated = True
+            self._state.last_sell_signal_gen = now.strftime("%Y-%m-%d %H:%M:%S")
+            if self._state.pending_sell_signals:
+                self._state.sell_signal_execution_date = now.strftime("%Y-%m-%d")
+        self._log("卖出信号生成完毕")
+
+    # ────────────── 21:25 盘后买入信号生成 ──────────────
+
+    def _generate_buy_signals(self, now: datetime.datetime) -> None:
+        """21:25~21:35 用完整日线重跑策略生成买入信号，保存为待买入标的（T+1 日 9:26 执行）。
+
+        安排在卖出信号生成（21:10）之后，确保：
+        1. Tushare 日线数据已就绪（收盘后数据完整）
+        2. 卖出信号已生成，可正确计算可用仓位（扣除待卖出腾出的仓位）
+        """
+        config = self._state.config
+        self._log("=" * 50)
+        self._log(f"─── {BUY_SIGNAL_TIME[0]:02d}:{BUY_SIGNAL_TIME[1]:02d} "
+                  f"买入信号生成: {config.strategy_name} ───")
 
         result = self._run_strategy_core()
         if result is None:
@@ -923,9 +983,13 @@ class TradingScheduler:
                     "ts_code": ts_code,
                     "name": name_map.get(ts_code, ""),
                 })
-            # ── 仓位上限校验：只计算策略范围内的 QMT 持仓 ──
+            # ── 仓位上限校验：只计算策略范围内持仓，考虑待卖出腾出的仓位 ──
             strategy_held_count = len(held_codes & strategy_codes)
-            available_slots = max(0, strategy_target - strategy_held_count)
+            with self._lock:
+                pending_sell_count = len(self._state.pending_sell_signals)
+            available_slots = max(
+                0, strategy_target - strategy_held_count + pending_sell_count
+            )
             if len(pending) > available_slots:
                 skipped = pending[available_slots:]
                 pending = pending[:available_slots]
@@ -956,182 +1020,9 @@ class TradingScheduler:
         with self._lock:
             self._state.today_buy_signals_generated = True
             self._state.last_buy_signal_gen = now.strftime("%Y-%m-%d %H:%M:%S")
-            # 标记今日已"处理"买入执行，阻止同日立即执行待买入信号（应在次日早盘执行）
             if self._state.pending_buy_signals:
                 self._state.buy_execution_date = now.strftime("%Y-%m-%d")
         self._log("买入信号生成完毕")
-
-    # ────────────── 21:10 盘后卖出信号补检 ──────────────
-
-    def _generate_sell_signals(self, now: datetime.datetime) -> None:
-        """21:10~21:20 用完整日线+筹码数据重跑策略，捕捉 14:53 因筹码缺失而遗漏的止盈信号。
-
-        补检逻辑：
-        1. 以完整日线（含当日收盘）重跑策略，获取全量卖出信号。
-        2. 排除 14:53 已经成功执行的卖出（today_orders）。
-        3. 剩余的即为"遗漏卖出"（含筹码补检止盈 + 死叉次日卖出等），
-           存入 pending_sell_signals，次日 9:26 执行。
-        """
-        config = self._state.config
-        self._log("=" * 50)
-        self._log(f"─── {SELL_SIGNAL_TIME[0]:02d}:{SELL_SIGNAL_TIME[1]:02d} "
-                  f"盘后卖出信号补检: {config.strategy_name} ───")
-
-        result = self._run_strategy_core()
-        if result is None:
-            with self._lock:
-                self._state.today_sell_signals_generated = True
-                self._state.last_sell_signal_gen = now.strftime("%Y-%m-%d %H:%M:%S")
-            return
-
-        sell_signals = result["sell_signals"]
-        held_codes = result["held_codes"]
-        name_map = result["name_map"]
-
-        with self._lock:
-            already_sold = {o.ts_code for o in self._state.today_orders if o.direction == "sell"}
-
-        if sell_signals:
-            pending: list[dict] = []
-            for sig in sell_signals:
-                ts_code = sig["ts_code"]
-                if ts_code in already_sold:
-                    self._log(f"  {ts_code}: 盘中已卖出，跳过")
-                    continue
-                if ts_code not in held_codes:
-                    self._log(f"  {ts_code}: QMT 无持仓，跳过")
-                    continue
-                reason = sig.get("reason", "策略卖出")
-                pending.append({
-                    "ts_code": ts_code,
-                    "name": name_map.get(ts_code, ""),
-                    "reason": reason,
-                })
-            if pending:
-                with self._lock:
-                    self._state.pending_sell_signals = pending
-                self._save_pending_signals()
-                self._log(f"补检发现 {len(pending)} 只遗漏卖出，将于下一交易日 9:26 委托卖出")
-                for p in pending:
-                    self._log(f"  待卖出: {p['ts_code']} {p['name']} ({p['reason']})")
-                self._notify_sell_signals(pending)
-            else:
-                self._log("补检完成，无遗漏卖出信号")
-                self._notify_no_sell_signal(len(already_sold))
-        else:
-            self._log("补检完成，策略无卖出信号")
-            with self._lock:
-                already_sold_count = sum(1 for o in self._state.today_orders if o.direction == "sell")
-            self._notify_no_sell_signal(already_sold_count)
-
-        with self._lock:
-            self._state.today_sell_signals_generated = True
-            self._state.last_sell_signal_gen = now.strftime("%Y-%m-%d %H:%M:%S")
-            if self._state.pending_sell_signals:
-                self._state.sell_signal_execution_date = now.strftime("%Y-%m-%d")
-        self._log("卖出信号补检完毕")
-
-    # ────────────── 21:25 盘后买入信号补检 ──────────────
-
-    def _generate_buy_recheck_signals(self, now: datetime.datetime) -> None:
-        """21:25~21:35 用完整日线重跑策略，捕捉因卖出补检新增卖出而配对的买入信号。
-
-        典型场景：21:10 卖出补检发现遗漏卖出 → 策略同时产生替换买入 →
-        15:30 买入信号阶段尚未感知到该卖出 → 此处补捕配对的买入。
-        新增买入会追加（而非覆盖）到 pending_buy_signals，次日早盘先卖后买。
-        """
-        config = self._state.config
-        self._log("=" * 50)
-        self._log(f"─── {BUY_RECHECK_TIME[0]:02d}:{BUY_RECHECK_TIME[1]:02d} "
-                  f"盘后买入信号补检: {config.strategy_name} ───")
-
-        result = self._run_strategy_core()
-        if result is None:
-            with self._lock:
-                self._state.today_buy_recheck_generated = True
-                self._state.last_buy_recheck_gen = now.strftime("%Y-%m-%d %H:%M:%S")
-            return
-
-        buy_signals = result["buy_signals"]
-        held_codes = result["held_codes"]
-        name_map = result["name_map"]
-        strategy_holdings = result["holdings"]
-        strategy_warnings = result.get("warnings", [])
-        strategy_diagnostics = result.get("diagnostics", [])
-
-        if strategy_diagnostics:
-            self._log(f"选股诊断 ({len(strategy_diagnostics)} 条):")
-            for d in strategy_diagnostics:
-                self._log(f"  {d}")
-
-        with self._lock:
-            existing_pending_codes = {p["ts_code"] for p in self._state.pending_buy_signals}
-
-        # 统一提取策略目标持仓代码集合（兼容 list[dict] 和 dict 两种格式）
-        if isinstance(strategy_holdings, dict):
-            strategy_codes = set(strategy_holdings.keys())
-        else:
-            strategy_codes = {h.get("ts_code", "") for h in strategy_holdings if h.get("ts_code")}
-        strategy_target = len(strategy_codes) or len(strategy_holdings)
-
-        if buy_signals:
-            new_pending: list[dict] = []
-            for sig in buy_signals:
-                ts_code = sig["ts_code"]
-                if ts_code in existing_pending_codes:
-                    self._log(f"  {ts_code}: 已在待买入队列中，跳过")
-                    continue
-                if not config.buy_existing and ts_code in held_codes:
-                    self._log(f"  {ts_code}: 已持仓且[买入已持仓]未开启，跳过")
-                    continue
-                new_pending.append({
-                    "ts_code": ts_code,
-                    "name": name_map.get(ts_code, ""),
-                })
-            # ── 仓位上限校验：只计算策略范围内持仓，考虑已有待买入和待卖出 ──
-            strategy_held_count = len(held_codes & strategy_codes)
-            with self._lock:
-                existing_buy_count = len(self._state.pending_buy_signals)
-                pending_sell_count = len(self._state.pending_sell_signals)
-            available_slots = max(
-                0, strategy_target - strategy_held_count + pending_sell_count - existing_buy_count
-            )
-            if len(new_pending) > available_slots:
-                skipped = new_pending[available_slots:]
-                new_pending = new_pending[:available_slots]
-                for p in skipped:
-                    self._log(f"  {p['ts_code']} {p['name']}: "
-                              f"超出可用仓位({available_slots}，"
-                              f"策略内持仓{strategy_held_count}只)，跳过")
-
-            if new_pending:
-                with self._lock:
-                    self._state.pending_buy_signals.extend(new_pending)
-                    self._state.strategy_target_holdings = strategy_target
-                    self._state.strategy_holding_codes = list(strategy_codes)
-                self._save_pending_signals()
-                self._log(f"买入补检发现 {len(new_pending)} 只新增待买入标的，"
-                          f"将于下一交易日 9:26 委托（先卖后买）")
-                for p in new_pending:
-                    self._log(f"  待买入: {p['ts_code']} {p['name']}")
-                self._notify_buy_recheck_signals(new_pending)
-            else:
-                self._log("买入补检完成，无新增买入信号")
-                self._notify_no_buy_recheck_signal(
-                    len(strategy_holdings), len(existing_pending_codes), strategy_warnings,
-                )
-        else:
-            self._log("买入补检完成，策略无买入信号")
-            self._notify_no_buy_recheck_signal(
-                len(strategy_holdings), len(existing_pending_codes), strategy_warnings,
-            )
-
-        with self._lock:
-            self._state.today_buy_recheck_generated = True
-            self._state.last_buy_recheck_gen = now.strftime("%Y-%m-%d %H:%M:%S")
-            if self._state.pending_buy_signals:
-                self._state.buy_execution_date = now.strftime("%Y-%m-%d")
-        self._log("买入信号补检完毕")
 
     # ────────────── T+1 早盘待卖出执行 ──────────────
 
@@ -1160,7 +1051,7 @@ class TradingScheduler:
         for sig in pending:
             ts_code = sig["ts_code"]
             name = sig.get("name", "")
-            reason = sig.get("reason", "盘后补检卖出")
+            reason = sig.get("reason", "盘后卖出")
             pos = pos_map.get(ts_code)
             if not pos or pos.available_volume <= 0:
                 self._log(f"  {ts_code} {name}: QMT 无可卖持仓，跳过")
@@ -1178,7 +1069,7 @@ class TradingScheduler:
 
             order_id = client.order_stock_sync(
                 ts_code=ts_code, direction="sell", volume=sell_vol,
-                price_type="latest", price=-1, remark="sell_补检_phase1",
+                price_type="latest", price=-1, remark="sell_pending_phase1",
             )
             if order_id > 0:
                 active_orders[ts_code] = {
@@ -1273,7 +1164,7 @@ class TradingScheduler:
                 new_id = client.order_stock_sync(
                     ts_code=ts_code, direction="sell", volume=remaining,
                     price_type="latest", price=new_price or -1,
-                    remark=f"sell_补检_retry{attempt}",
+                    remark=f"sell_pending_retry{attempt}",
                 )
                 if new_id > 0:
                     active_orders[ts_code] = {**info, "order_id": new_id, "remaining": remaining}
@@ -1736,7 +1627,7 @@ class TradingScheduler:
         from app.trading.feishu_notifier import send_feishu_notification, build_line, build_divider
         today = datetime.date.today().strftime("%Y-%m-%d")
         title = f"\U0001F4C9 卖出信号 ({len(pending)}只) - {today}"
-        sections = [build_line(f"\U0001F4CB 补检发现 {len(pending)} 只待卖出：")]
+        sections = [build_line(f"\U0001F4CB 发现 {len(pending)} 只待卖出：")]
         sections.append(build_divider())
         for i, p in enumerate(pending, 1):
             reason = p.get("reason", "")
@@ -1749,43 +1640,12 @@ class TradingScheduler:
     def _notify_no_sell_signal(self, already_sold_count: int) -> None:
         from app.trading.feishu_notifier import send_feishu_notification, build_line, build_divider
         today = datetime.date.today().strftime("%Y-%m-%d")
-        title = f"\u2705 卖出补检完成 - {today}"
-        sections = [build_line("\U0001F50D 盘后卖出信号补检完成")]
+        title = f"\u2705 卖出信号扫描完成 - {today}"
+        sections = [build_line("\U0001F50D 盘后卖出信号扫描完成")]
         sections.append(build_divider())
         if already_sold_count > 0:
             sections.append(build_line(f"\U0001F4BC 盘中已卖出 {already_sold_count} 只"))
         sections.append(build_line("\u2705 无遗漏卖出信号，持仓无需变动"))
-        send_feishu_notification(title, sections)
-
-    def _notify_buy_recheck_signals(self, pending: list[dict]) -> None:
-        from app.trading.feishu_notifier import send_feishu_notification, build_line, build_divider
-        today = datetime.date.today().strftime("%Y-%m-%d")
-        title = f"\U0001F504 买入补检 ({len(pending)}只) - {today}"
-        sections = [build_line(f"\U0001F4CB 盘后买入补检发现 {len(pending)} 只新增待买入：")]
-        sections.append(build_divider())
-        for i, p in enumerate(pending, 1):
-            sections.append(build_line(f"  {i}. {p['ts_code']}  {p.get('name', '')}"))
-        sections.append(build_divider())
-        sections.append(build_line("\u23F0 将于下一交易日 9:26 委托（先卖后买）"))
-        send_feishu_notification(title, sections)
-
-    def _notify_no_buy_recheck_signal(
-        self, holdings_count: int, existing_pending_count: int, strategy_warnings: list[str],
-    ) -> None:
-        from app.trading.feishu_notifier import send_feishu_notification, build_line, build_divider
-        today = datetime.date.today().strftime("%Y-%m-%d")
-        title = f"\u2705 买入补检完成 - {today}"
-        sections = [build_line("\U0001F50D 盘后买入信号补检完成")]
-        sections.append(build_divider())
-        sections.append(build_line(f"\U0001F4BC 策略目标持仓 {holdings_count} 只"))
-        if existing_pending_count > 0:
-            sections.append(build_line(f"\U0001F4E6 已有 {existing_pending_count} 只待买入（15:30 生成）"))
-        sections.append(build_line("\u2705 无新增买入信号"))
-        if strategy_warnings:
-            sections.append(build_divider())
-            sections.append(build_line("\u26A0\uFE0F 策略警告："))
-            for w in strategy_warnings[-5:]:
-                sections.append(build_line(f"  \u2022 {w}"))
         send_feishu_notification(title, sections)
 
     def _notify_sell_phase(self, sell_signals: list[dict], name_map: dict[str, str]) -> None:

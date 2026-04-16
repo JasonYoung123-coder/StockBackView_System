@@ -697,11 +697,14 @@
       if (lines.length === 0) return;
       const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
       const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
+      const url = URL.createObjectURL(blob);
+      a.href = url;
       const today = new Date().toISOString().slice(0, 10);
       a.download = `scheduler_log_${today}.txt`;
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(a.href);
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
   }
 

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>劲帆交易回测系统</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=5" />
+    <link rel="stylesheet" href="/static/css/style.css?v=6" />
     <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
   </head>
   <body>
@@ -98,6 +98,16 @@
             <div class="progress-track">
               <div id="progress-bar" class="progress-bar"></div>
             </div>
+          </div>
+
+          <!-- 回测进行中 tips -->
+          <div id="backtest-loading" class="backtest-loading hidden">
+            <div class="loading-visual">
+              <div class="pulse-ring"></div>
+              <div class="pulse-icon">⏳</div>
+            </div>
+            <p class="loading-title">策略回测进行中</p>
+            <p id="loading-tip" class="loading-tip"></p>
           </div>
 
           <!-- 回测前引导占位 -->
@@ -287,7 +297,7 @@
             <div class="subsection-head">
               <h3>待卖出标的</h3>
               <span id="pending-sells-count" class="muted"></span>
-              <span class="muted" style="margin-left:8px;font-size:11px;">（盘后补检，将于下一交易日 9:26 委托卖出）</span>
+              <span class="muted" style="margin-left:8px;font-size:11px;">（盘后生成，将于下一交易日 9:26 委托卖出）</span>
             </div>
             <div class="table-wrapper" style="max-height:200px;">
               <table class="trade-table compact">
@@ -370,7 +380,7 @@
 
     </main>
 
-    <script src="/static/js/backtest.js?v=5"></script>
-    <script src="/static/js/trading.js?v=7"></script>
+    <script src="/static/js/backtest.js?v=6"></script>
+    <script src="/static/js/trading.js?v=8"></script>
   </body>
 </html>

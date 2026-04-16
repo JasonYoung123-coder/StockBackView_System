@@ -23,6 +23,8 @@ const dailyOverviewEl = document.getElementById("daily-overview");
 const dailyHoldingsEl = document.getElementById("daily-holdings");
 const dailyHoldingsCountEl = document.getElementById("daily-holdings-count");
 const backtestPlaceholderEl = document.getElementById("backtest-placeholder");
+const backtestLoadingEl = document.getElementById("backtest-loading");
+const loadingTipEl = document.getElementById("loading-tip");
 let chart = null;
 
 let currentPollingTimer = null;
@@ -33,6 +35,22 @@ let currentJobId = "";
 let currentJobResult = null;
 let currentDailyPositionDetails = new Map();
 let lastRenderedDetailDate = "";
+let _lastMouseX = 0;
+let _lastMouseY = 0;
+let _tipTimer = null;
+
+const BACKTEST_TIPS = [
+  "💡 回测采用日频调仓，每个交易日收盘后生成次日目标组合权重",
+  "📈 收益曲线的基准线为沪深300全收益指数（含分红再投资）",
+  "🔍 回测完成后，将鼠标悬停在收益曲线上可查看每日持仓明细",
+  "⚙️ 手续费与印花税会直接影响策略净收益，建议使用实际费率",
+  "📊 最大回撤反映策略最坏情况下的亏损幅度，是风险评估的关键指标",
+  "🔄 策略参数可在左侧面板调整，不同参数组合可能产生截然不同的结果",
+  "📅 回测区间建议覆盖完整的牛熊周期，避免过拟合",
+  "💰 夏普比率 > 1 通常被认为是不错的风险调整收益",
+  "📉 关注逐笔交易记录中的「持有天数」，可帮助理解策略的换手节奏",
+  "🎯 胜率不是唯一标准——低胜率但高盈亏比的策略也可以盈利",
+];
 
 const jobIdEl = document.createElement("span");
 jobIdEl.className = "muted";
@@ -129,6 +147,28 @@ function setProgress(progress, message) {
 
 function hideProgress() {
   progressContainerEl.classList.add("hidden");
+  hideLoadingTips();
+}
+
+function showLoadingTips() {
+  if (!backtestLoadingEl || !loadingTipEl) return;
+  if (backtestPlaceholderEl) backtestPlaceholderEl.classList.add("hidden");
+  backtestLoadingEl.classList.remove("hidden");
+  let idx = Math.floor(Math.random() * BACKTEST_TIPS.length);
+  loadingTipEl.textContent = BACKTEST_TIPS[idx];
+  _tipTimer = setInterval(() => {
+    loadingTipEl.style.opacity = "0";
+    setTimeout(() => {
+      idx = (idx + 1) % BACKTEST_TIPS.length;
+      loadingTipEl.textContent = BACKTEST_TIPS[idx];
+      loadingTipEl.style.opacity = "1";
+    }, 400);
+  }, 5000);
+}
+
+function hideLoadingTips() {
+  if (_tipTimer) { clearInterval(_tipTimer); _tipTimer = null; }
+  if (backtestLoadingEl) backtestLoadingEl.classList.add("hidden");
 }
 
 function clearPreviousResult() {
@@ -324,6 +364,7 @@ function renderDailyDetail(date) {
   }
 
   dailyDetailPanelEl.classList.remove("hidden");
+  positionFloatingPanel(_lastMouseX, _lastMouseY);
 }
 
 function hideDailyDetail() {
@@ -333,6 +374,35 @@ function hideDailyDetail() {
   dailyHoldingsEl.innerHTML = "";
   dailyHoldingsCountEl.textContent = "";
   lastRenderedDetailDate = "";
+}
+
+let _panelSide = "right";
+let _panelLeft = 0;
+let _panelWidth = 420;
+let _panelTop = 0;
+
+function positionFloatingPanel(mx, my) {
+  if (!dailyDetailPanelEl || dailyDetailPanelEl.classList.contains("hidden")) return;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const pw = dailyDetailPanelEl.offsetWidth || 420;
+  const ph = dailyDetailPanelEl.offsetHeight || 300;
+  const gap = 16;
+  let left = mx + gap;
+  let top = my - ph / 2;
+  let side = "right";
+  if (left + pw + 220 > vw - 10) {
+    left = mx - pw - gap;
+    side = "left";
+  }
+  if (top < 10) top = 10;
+  if (top + ph > vh - 10) top = vh - ph - 10;
+  dailyDetailPanelEl.style.left = left + "px";
+  dailyDetailPanelEl.style.top = top + "px";
+  _panelSide = side;
+  _panelLeft = left;
+  _panelWidth = pw;
+  _panelTop = top;
 }
 
 function renderChart(curves) {
@@ -384,6 +454,27 @@ function renderChart(curves) {
   chart.setOption({
     tooltip: {
       trigger: "axis",
+      position: (point, params, dom, rect, size) => {
+        if (!dailyDetailPanelEl || dailyDetailPanelEl.classList.contains("hidden")) {
+          return { top: 60, left: point[0] + 20 };
+        }
+        const chartRect = chartEl.getBoundingClientRect();
+        const tw = size.contentSize[0];
+        const th = size.contentSize[1];
+        const tGap = 8;
+        let tx, ty;
+        if (_panelSide === "right") {
+          tx = _panelLeft + _panelWidth + tGap - chartRect.left;
+        } else {
+          tx = _panelLeft - tw - tGap - chartRect.left;
+        }
+        ty = _panelTop - chartRect.top;
+        if (tx < 4) tx = 4;
+        if (tx + tw > size.viewSize[0] - 4) tx = size.viewSize[0] - tw - 4;
+        if (ty < 4) ty = 4;
+        if (ty + th > size.viewSize[1] - 4) ty = size.viewSize[1] - th - 4;
+        return [tx, ty];
+      },
       formatter: (params) => {
         if (!Array.isArray(params) || !params.length) return "";
         const date = params[0].axisValue || "";
@@ -442,6 +533,18 @@ function renderChart(curves) {
       renderDailyDetail(date);
     }
   });
+
+  if (!chartEl._floatBound) {
+    chartEl.addEventListener("mousemove", (e) => {
+      _lastMouseX = e.clientX;
+      _lastMouseY = e.clientY;
+      positionFloatingPanel(_lastMouseX, _lastMouseY);
+    });
+    chartEl.addEventListener("mouseleave", () => {
+      hideDailyDetail();
+    });
+    chartEl._floatBound = true;
+  }
 }
 
 function showLastDayDetail() {
@@ -552,7 +655,6 @@ async function pollBacktestJob(jobId) {
     currentTradeRecords = job.result.trade_records || [];
     renderTradeRecords(currentTradeRecords);
     renderChart(job.result.curves);
-    showLastDayDetail();
     statusEl.textContent = `回测完成：${job.result.asset}，策略 ${job.result.strategy.name}`;
     submitButton.disabled = false;
     hideProgress();
@@ -580,6 +682,7 @@ formEl.addEventListener("submit", async (event) => {
   submitButton.disabled = true;
   clearPreviousResult();
   setProgress(0, "正在创建回测任务...");
+  showLoadingTips();
   statusEl.textContent = "回测执行中，请稍候...";
 
   const formData = new FormData(formEl);

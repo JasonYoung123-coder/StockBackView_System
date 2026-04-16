@@ -390,12 +390,14 @@ class Strategy(BaseStrategy):
         # ── 近30日最低价 (用于止损) ──
         frame["low_30d"] = _gt("low", lambda s: s.rolling(self.stop_loss_low_lookback, min_periods=1).min())
 
-        # ── 近20日振幅: (最高价 - 最低价) / 最低价 (用于排除异常波动股) ──
+        # ── 近20日振幅: (最高价 - 最低价) / 第21个交易日前收盘价 ──
         _high_20d = _gt("high", lambda s: s.rolling(20, min_periods=20).max())
         _low_20d = _gt("low", lambda s: s.rolling(20, min_periods=20).min())
+        _close_prev21 = _gt("close", lambda s: s.shift(20))
         frame["high_20d"] = _high_20d
         frame["low_20d"] = _low_20d
-        frame["amplitude_20d"] = ((_high_20d - _low_20d) / _low_20d.replace(0.0, pd.NA)).fillna(0.0)
+        frame["close_prev21"] = _close_prev21
+        frame["amplitude_20d"] = ((_high_20d - _low_20d) / _close_prev21.replace(0.0, pd.NA)).fillna(0.0)
 
         # ── 成交量日变化率 (用于评分3) ──
         frame["vol_pct_change"] = _gt("vol", lambda s: s.pct_change()).fillna(0.0)
@@ -731,12 +733,13 @@ class Strategy(BaseStrategy):
                 name = row.get("name", "")
                 h20 = row.get("high_20d", 0)
                 l20 = row.get("low_20d", 0)
+                c21 = row.get("close_prev21", 0)
                 self._diagnostics.append(
                     f"  #{i+1} {row['ts_code']} {name}  "
                     f"评分={row['score']:.0f}  KDJ_J={row['kdj_j']:.2f}  "
                     f"偏离={row['price_diff_ratio']:.2f}%  "
                     f"振幅={row.get('amplitude_20d', 0):.4f}"
-                    f"(H={h20:.2f}/L={l20:.2f})  "
+                    f"(H={h20:.2f}/L={l20:.2f}/基准C={c21:.2f})  "
                     f"量价={row.get('vol_pattern_15d', 0):.0f}")
 
         return result
@@ -794,12 +797,13 @@ class Strategy(BaseStrategy):
 
             amp = row.get("amplitude_20d", 0)
             if amp > 0.40:
-                # 展示振幅计算明细方便核对
                 h20 = row.get("high_20d", None)
                 l20 = row.get("low_20d", None)
+                c21 = row.get("close_prev21", None)
                 if h20 is not None and l20 is not None and not pd.isna(h20) and not pd.isna(l20):
+                    c21_str = f", 基准C={c21:.2f}" if c21 is not None and not pd.isna(c21) else ""
                     reasons.append(
-                        f"振幅{amp:.4f}>0.40 (20d_high={h20:.2f}, 20d_low={l20:.2f})")
+                        f"振幅{amp:.4f}>0.40 (20d_H={h20:.2f}, 20d_L={l20:.2f}{c21_str})")
                 else:
                     reasons.append(f"振幅{amp:.4f}>0.40")
 
