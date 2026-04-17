@@ -58,6 +58,8 @@ class Strategy(BaseStrategy):
     _realtime_prices: dict[str, dict] = {}
     _live_trade_start_date: pd.Timestamp | None = None
     _qmt_held_codes: set[str] | None = None
+    _adopted_positions: dict[str, dict] = {}
+    _skip_score_replace: bool = False
     _enable_diagnostics: bool = False
     _diagnostics: list[str] = []
 
@@ -71,6 +73,8 @@ class Strategy(BaseStrategy):
         *,
         live_start_date: str | pd.Timestamp | None = None,
         qmt_held_codes: set[str] | None = None,
+        adopted_positions: dict[str, dict] | None = None,
+        skip_score_replace: bool = False,
     ) -> dict:
         """实盘交易模式：使用实时行情生成买卖信号。
 
@@ -81,10 +85,15 @@ class Strategy(BaseStrategy):
         - qmt_held_codes：QMT 实际持仓代码集合。传入后，策略在最后一天
           会对比内部模拟持仓与 QMT 实际持仓，自动清除"幻影持仓"
           （策略以为持有但 QMT 已无）以释放仓位给新候选股。
+        - adopted_positions：手动买入后被策略接管的持仓。注入到 holdings 中，
+          使其接受止损/止盈/调仓管理。
+        - skip_score_replace：跳过7分股替换亏损低分持仓逻辑（下午盘中数据不完整时使用）。
         """
         self._live_execution_mode = True
         self._realtime_prices = realtime_prices
         self._qmt_held_codes = qmt_held_codes
+        self._adopted_positions = adopted_positions or {}
+        self._skip_score_replace = skip_score_replace
         self._diagnostics = []
         if live_start_date is not None:
             self._live_trade_start_date = pd.Timestamp(live_start_date).normalize()
@@ -97,6 +106,8 @@ class Strategy(BaseStrategy):
             self._realtime_prices = {}
             self._live_trade_start_date = None
             self._qmt_held_codes = None
+            self._adopted_positions = {}
+            self._skip_score_replace = False
 
         last_date = weights.index[-1] if not weights.empty else None
         last_date_str = last_date.strftime("%Y-%m-%d") if last_date else ""
@@ -232,6 +243,29 @@ class Strategy(BaseStrategy):
                     self._chips_cache.pop(ts_code, None)
                     self._chips_fetched_end.pop(ts_code, None)
                     self._chips_missing_attempts.pop(ts_code, None)
+
+                # ── 注入持仓注册表中的持仓（phantom 清理之后、卖出判断之前） ──
+                if self._adopted_positions:
+                    for a_code, a_info in self._adopted_positions.items():
+                        if a_code in self._qmt_held_codes and a_code not in holdings:
+                            source = a_info.get("source", "manual")
+                            holdings[a_code] = {
+                                "ts_code": a_code,
+                                "name": a_info.get("name", ""),
+                                "industry": "未知",
+                                "score": 0,
+                                "selection_reason": "手动买入-策略接管" if source == "manual" else "持仓注册-策略重建",
+                                "buy_date": pd.Timestamp(a_info["buy_date"]),
+                                "buy_price": a_info["buy_price"],
+                                "weight": self.position_per_stock,
+                            }
+                            label = "手动持仓已接管" if source == "manual" else "注册持仓已重建"
+                            self._add_warning(
+                                a_code, trade_date,
+                                f"{label}: "
+                                f"买入日{a_info['buy_date']} "
+                                f"买入价{a_info['buy_price']:.2f}",
+                            )
 
             # ── 卖出判断 ──
             for ts_code in list(holdings.keys()):
@@ -884,7 +918,7 @@ class Strategy(BaseStrategy):
         oamv_regime: str,
     ) -> int:
         replaced = 0
-        if oamv_regime in self.force_full_regimes:
+        if oamv_regime in self.force_full_regimes and not self._skip_score_replace:
             replaced += self._replace_losing_non_top_score_holdings(
                 prepared, trade_date, holdings, sell_reasons, buy_prices,
             )

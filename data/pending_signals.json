@@ -1,0 +1,13 @@
+{
+  "pending_sell_signals": [],
+  "pending_buy_signals": [],
+  "strategy_target_holdings": 5,
+  "strategy_holding_codes": [
+    "300813.SZ",
+    "300866.SZ",
+    "002594.SZ",
+    "603387.SH",
+    "000617.SZ"
+  ],
+  "updated_at": "2026-04-15 17:04:28"
+}

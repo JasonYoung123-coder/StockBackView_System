@@ -174,6 +174,100 @@ class TradingScheduler:
         except Exception as exc:
             logger.warning("清除 pending 文件失败: %s", exc)
 
+    # ────────────── 手动信号 & 接管持仓 ──────────────
+
+    _MANUAL_SIGNALS_FILE = "manual_signals.json"
+    _ADOPTED_POSITIONS_FILE = "adopted_positions.json"
+
+    def _consume_manual_sells(self) -> list[dict]:
+        """读取 data/manual_signals.json 中的手动卖出信号，读取后仅清空 sell 部分。"""
+        path = get_settings().data_dir / self._MANUAL_SIGNALS_FILE
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            sell = data.get("sell", [])
+            if sell:
+                data["sell"] = []
+                path.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            return sell
+        except Exception as exc:
+            logger.warning("读取手动卖出信号失败: %s", exc)
+            return []
+
+    def _consume_manual_buys(self) -> list[dict]:
+        """读取 data/manual_signals.json 中的手动买入信号，读取后仅清空 buy 部分。"""
+        path = get_settings().data_dir / self._MANUAL_SIGNALS_FILE
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            buy = data.get("buy", [])
+            if buy:
+                data["buy"] = []
+                path.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            return buy
+        except Exception as exc:
+            logger.warning("读取手动买入信号失败: %s", exc)
+            return []
+
+    def _load_adopted_positions(self) -> dict[str, dict]:
+        """读取 data/adopted_positions.json 持仓注册表（含策略买入和手动买入）。"""
+        path = get_settings().data_dir / self._ADOPTED_POSITIONS_FILE
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data.get("positions", {})
+        except Exception as exc:
+            logger.warning("读取接管持仓失败: %s", exc)
+            return {}
+
+    def _save_adopted_positions(self, positions: dict[str, dict]) -> None:
+        """写入 data/adopted_positions.json。"""
+        path = get_settings().data_dir / self._ADOPTED_POSITIONS_FILE
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            data = {
+                "positions": positions,
+                "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:
+            logger.warning("保存接管持仓失败: %s", exc)
+
+    def _remove_adopted_position(self, ts_code: str) -> None:
+        """从持仓注册表中移除指定股票（卖出后调用）。"""
+        adopted = self._load_adopted_positions()
+        if ts_code in adopted:
+            del adopted[ts_code]
+            self._save_adopted_positions(adopted)
+            self._log(f"  已从持仓注册表中移除 {ts_code}")
+
+    def _add_adopted_position(self, ts_code: str, name: str,
+                              buy_date: str, buy_price: float,
+                              source: str = "manual") -> None:
+        """将买入的股票加入持仓注册表（策略买入或手动买入均记录）。"""
+        adopted = self._load_adopted_positions()
+        adopted[ts_code] = {
+            "ts_code": ts_code,
+            "name": name,
+            "buy_date": buy_date,
+            "buy_price": round(buy_price, 3),
+            "source": source,
+        }
+        self._save_adopted_positions(adopted)
+        self._log(f"  已加入持仓注册表: {ts_code} {name} "
+                  f"买入日={buy_date} 买入价={buy_price:.2f} 来源={source}")
+
     # ──────────────────────────────────────────────
 
     def _log(self, msg: str) -> None:
@@ -592,6 +686,19 @@ class TradingScheduler:
         # ── 资金变动检测 ──
         self._detect_fund_change(account_info)
 
+        # ── 读取持仓注册表 ──
+        adopted = self._load_adopted_positions()
+        # 清理 QMT 已不持有的注册条目（兜底：防止崩溃等导致卖出后未正常清理）
+        stale = [code for code in adopted if code not in held_codes]
+        if stale:
+            for code in stale:
+                del adopted[code]
+            self._save_adopted_positions(adopted)
+            self._log(f"清理持仓注册表中已不存在的股票: {', '.join(stale)}")
+        if adopted:
+            self._log(f"已加载 {len(adopted)} 只持仓注册: "
+                       f"{', '.join(adopted.keys())}")
+
         # ── 运行策略（传入 QMT 实际持仓供策略对齐） ──
         live_start = config.live_start_date or today.strftime("%Y-%m-%d")
         self._log(f"运行策略生成实盘信号（起始日: {live_start}）...")
@@ -600,6 +707,8 @@ class TradingScheduler:
                 market_data, trade_dates, realtime_prices,
                 live_start_date=live_start,
                 qmt_held_codes=held_codes,
+                adopted_positions=adopted,
+                skip_score_replace=realtime_only,
             )
         else:
             self._log("[警告] 策略不支持实盘信号，回退到回测模式")
@@ -925,6 +1034,32 @@ class TradingScheduler:
                 already_sold_count = sum(1 for o in self._state.today_orders if o.direction == "sell")
             self._notify_no_sell_signal(already_sold_count)
 
+        # ── 合并手动卖出信号 ──
+        manual_sells = self._consume_manual_sells()
+        if manual_sells:
+            self._log(f"检测到 {len(manual_sells)} 只手动卖出信号")
+            with self._lock:
+                existing_codes = {s["ts_code"] for s in self._state.pending_sell_signals}
+            for ms in manual_sells:
+                ts_code = ms.get("ts_code", "")
+                if not ts_code:
+                    continue
+                if ts_code in existing_codes:
+                    self._log(f"  {ts_code}: 策略已产生卖出信号，跳过手动信号")
+                    continue
+                if ts_code not in held_codes if result else True:
+                    self._log(f"  {ts_code}: QMT 无持仓，跳过")
+                    continue
+                reason = ms.get("reason", "手动卖出")
+                name = ms.get("name", "") or (name_map.get(ts_code, "") if result else "")
+                manual_entry = {"ts_code": ts_code, "name": name,
+                                "reason": reason, "manual": True}
+                with self._lock:
+                    self._state.pending_sell_signals.append(manual_entry)
+                self._log(f"  手动待卖出: {ts_code} {name} ({reason})")
+            if manual_sells:
+                self._save_pending_signals()
+
         with self._lock:
             self._state.today_sell_signals_generated = True
             self._state.last_sell_signal_gen = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -1016,6 +1151,27 @@ class TradingScheduler:
             self._notify_no_buy_signal(
                 len(strategy_holdings), strategy_target, strategy_warnings,
             )
+
+        # ── 合并手动买入信号（不受仓位上限约束） ──
+        manual_buys = self._consume_manual_buys()
+        if manual_buys:
+            self._log(f"检测到 {len(manual_buys)} 只手动买入信号")
+            with self._lock:
+                existing_codes = {s["ts_code"] for s in self._state.pending_buy_signals}
+            for mb in manual_buys:
+                ts_code = mb.get("ts_code", "")
+                if not ts_code:
+                    continue
+                if ts_code in existing_codes:
+                    self._log(f"  {ts_code}: 已在待买入列表中，跳过")
+                    continue
+                name = mb.get("name", "") or (name_map.get(ts_code, "") if result else "")
+                manual_entry = {"ts_code": ts_code, "name": name, "manual": True}
+                with self._lock:
+                    self._state.pending_buy_signals.append(manual_entry)
+                self._log(f"  手动待买入: {ts_code} {name}")
+            if manual_buys:
+                self._save_pending_signals()
 
         with self._lock:
             self._state.today_buy_signals_generated = True
@@ -1180,6 +1336,12 @@ class TradingScheduler:
             self._state.sell_signal_execution_date = now.strftime("%Y-%m-%d")
         self._save_pending_signals()
 
+        # ── 清理已卖出的持仓注册表条目（仅清理实际下了卖单的） ──
+        for sig in pending:
+            ts_code = sig["ts_code"]
+            if ts_code in active_orders:
+                self._remove_adopted_position(ts_code)
+
         self._collect_qmt_logs()
         if sell_order_items:
             self._notify_execution_result("早盘卖出", sell_order_items)
@@ -1259,29 +1421,35 @@ class TradingScheduler:
 
         from app.trading.order_generator import _round_to_lot
 
-        # ── 兜底校验：执行时策略范围内持仓不超限 ──
+        # ── 手动买入不受仓位上限约束，先分离 ──
+        manual_pending = [s for s in pending if s.get("manual")]
+        strategy_pending = [s for s in pending if not s.get("manual")]
+
+        # ── 兜底校验：执行时策略范围内持仓不超限（仅策略买入） ──
         strategy_target = self._state.strategy_target_holdings
-        if strategy_target > 0:
+        if strategy_target > 0 and strategy_pending:
             qmt_positions = client.query_positions()
             qmt_codes = {p.ts_code for p in qmt_positions if p.volume > 0}
             strategy_codes = set(self._state.strategy_holding_codes)
-            pending_buy_codes = {sig["ts_code"] for sig in pending}
+            pending_buy_codes = {sig["ts_code"] for sig in strategy_pending}
             strategy_current = len(qmt_codes & (strategy_codes - pending_buy_codes))
             max_buys = max(0, strategy_target - strategy_current)
-            if max_buys < len(pending):
-                skipped = pending[max_buys:]
-                pending = pending[:max_buys]
+            if max_buys < len(strategy_pending):
+                skipped = strategy_pending[max_buys:]
+                strategy_pending = strategy_pending[:max_buys]
                 for p in skipped:
                     self._log(f"  {p['ts_code']} {p.get('name', '')}: "
                               f"策略内持仓{strategy_current}只，目标{strategy_target}只，"
                               f"可买入{max_buys}只，跳过")
-            if not pending:
-                self._log("持仓已达目标上限，跳过全部买入")
-                with self._lock:
-                    self._state.pending_buy_signals = []
-                    self._state.buy_execution_date = now.strftime("%Y-%m-%d")
-                self._save_pending_signals()
-                return
+
+        pending = strategy_pending + manual_pending
+        if not pending:
+            self._log("持仓已达目标上限且无手动买入，跳过全部买入")
+            with self._lock:
+                self._state.pending_buy_signals = []
+                self._state.buy_execution_date = now.strftime("%Y-%m-%d")
+            self._save_pending_signals()
+            return
 
         # ── Phase 1: 首次委托 ──
         active_orders: dict[str, dict] = {}
@@ -1431,6 +1599,18 @@ class TradingScheduler:
             self._state.pending_buy_signals = []
             self._state.buy_execution_date = now.strftime("%Y-%m-%d")
         self._save_pending_signals()
+
+        # ── 将所有买入加入持仓注册表 ──
+        order_price_map = {item.ts_code: item.price for item in buy_order_items}
+        for sig in pending:
+            if sig["ts_code"] in order_price_map:
+                self._add_adopted_position(
+                    ts_code=sig["ts_code"],
+                    name=sig.get("name", ""),
+                    buy_date=now.strftime("%Y-%m-%d"),
+                    buy_price=order_price_map[sig["ts_code"]],
+                    source="manual" if sig.get("manual") else "strategy",
+                )
 
         self._collect_qmt_logs()
         if buy_order_items:
