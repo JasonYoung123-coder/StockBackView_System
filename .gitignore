@@ -17,6 +17,16 @@ data/cache/
 # Runtime logs (auto-generated, persisted locally)
 data/logs/
 
+# Replay outputs (auto-generated)
+data/replay/
+
+# Temp scratch files
+data/Untitled-*.txt
+data/日志临时文件.txt
+
+# Analysis outputs (regenerated from scripts)
+analysis/output/
+
 # Sensitive config (use config.example.toml as template)
 config/config.toml
 
