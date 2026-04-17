@@ -112,6 +112,54 @@ class TushareClient:
             fetcher=self.client.adj_factor,
         )
 
+    def get_moneyflow_ths_by_trade_date(self, trade_date: str) -> pd.DataFrame:
+        return self._get_snapshot(
+            kind="moneyflow_ths",
+            trade_date=trade_date,
+            fields="ts_code,trade_date,name,net_amount",
+            fetcher=self.client.moneyflow_ths,
+        )
+
+    def get_moneyflow_cnt_ths_by_trade_date(self, trade_date: str) -> pd.DataFrame:
+        return self._get_snapshot(
+            kind="moneyflow_cnt_ths",
+            trade_date=trade_date,
+            fields="ts_code,trade_date,name,net_amount",
+            fetcher=self.client.moneyflow_cnt_ths,
+        )
+
+    def get_ths_member(self, ts_code: str) -> pd.DataFrame:
+        cache_file = self.settings.cache_dir / "ths_member" / f"{ts_code.replace('.', '_')}.csv"
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        if cache_file.exists():
+            cached = pd.read_csv(cache_file)
+            if not cached.empty:
+                return cached
+        frame = self._call_with_retry(
+            self.client.ths_member, ts_code=ts_code,
+            fields="ts_code,code,name,is_new",
+        )
+        if frame is None or frame.empty:
+            return pd.DataFrame(columns=["ts_code", "code", "name", "is_new"])
+        frame.to_csv(cache_file, index=False)
+        return frame
+
+    def get_ths_member_by_stock(self, con_code: str) -> pd.DataFrame:
+        cache_file = self.settings.cache_dir / "ths_member_stock" / f"{con_code.replace('.', '_')}.csv"
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        if cache_file.exists():
+            cached = pd.read_csv(cache_file)
+            if not cached.empty:
+                return cached
+        frame = self._call_with_retry(
+            self.client.ths_member, con_code=con_code,
+            fields="ts_code,code,name,is_new",
+        )
+        if frame is None or frame.empty:
+            return pd.DataFrame(columns=["ts_code", "code", "name", "is_new"])
+        frame.to_csv(cache_file, index=False)
+        return frame
+
     def get_idx_factor_pro(
         self, ts_code: str, start_date: str, end_date: str,
         fields: str = "ts_code,trade_date,close,ma_bfq_250,macd_dif_bfq",
