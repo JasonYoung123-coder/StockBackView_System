@@ -108,8 +108,11 @@ class TradingCalendar:
         if "pretrade_date" in df.columns:
             for row in df.itertuples():
                 pretrade = getattr(row, "pretrade_date", None)
-                if pd.notna(pretrade):
-                    prev_map[row.cal_date] = pd.to_datetime(pretrade).date()
+                if pd.isna(pretrade):
+                    continue
+                parsed = _parse_yyyymmdd(pretrade)
+                if parsed is not None:
+                    prev_map[row.cal_date] = parsed
         last_open: datetime.date | None = None
         for d in all_dates:
             if d not in prev_map and last_open is not None:
@@ -127,6 +130,28 @@ class TradingCalendar:
             if is_open_by_date[d]:
                 next_open = d
         self._next_map = next_map
+
+
+def _parse_yyyymmdd(value) -> datetime.date | None:
+    """解析 Tushare 日期字段,兼容字符串 '20260430' 和 CSV 读回的 float 20260430.0。"""
+    if value is None:
+        return None
+    if isinstance(value, float):
+        if pd.isna(value):
+            return None
+        value = int(value)
+    if isinstance(value, int):
+        s = str(value)
+    else:
+        s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return None
+    try:
+        if len(s) == 8 and s.isdigit():
+            return datetime.date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+        return pd.to_datetime(s).date()
+    except Exception:
+        return None
 
 
 _CALENDAR: TradingCalendar | None = None
