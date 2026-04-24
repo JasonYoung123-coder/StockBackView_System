@@ -180,8 +180,13 @@ class Strategy(BaseStrategy):
             "vol", lambda s: s.rolling(30, min_periods=1).max(),
         )
 
-        _prev_low = _gt("low", lambda s: s.shift(1))
-        frame["stop_loss_ref"] = frame[["low"]].assign(prev_low=_prev_low).min(axis=1)
+        # 近3日是否连续上涨: pct_chg > 0 连续3天
+        _up = (frame["pct_chg"] > 0).astype(float)
+        frame["consecutive_up_3d"] = _gt(
+            "pct_chg", lambda s: (s > 0).astype(float).rolling(n, min_periods=n).min(),
+        ).fillna(0).astype(bool)
+
+        frame["stop_loss_ref"] = frame["low"]
 
     # ─────────────────────── 卖出逻辑 ───────────────────────
 
@@ -283,12 +288,12 @@ class Strategy(BaseStrategy):
             if execution_date is None or execution_price is None:
                 continue
 
-            signal_row = prepared.loc[
-                (prepared["ts_code"] == row.ts_code) & (prepared["trade_date"] == trade_date)
+            exec_row = prepared.loc[
+                (prepared["ts_code"] == row.ts_code) & (prepared["trade_date"] == execution_date)
             ]
             stop_loss_price = (
-                float(signal_row.iloc[0]["stop_loss_ref"])
-                if not signal_row.empty and pd.notna(signal_row.iloc[0].get("stop_loss_ref"))
+                float(exec_row.iloc[0]["low"])
+                if not exec_row.empty and pd.notna(exec_row.iloc[0].get("low"))
                 else 0.0
             )
 
@@ -331,6 +336,7 @@ class Strategy(BaseStrategy):
             (~day["ts_code"].isin(held))
             & (day["cum_gain_3d"].notna())
             & (day["cum_gain_3d"] >= self.cumulative_gain_threshold)
+            & (day["consecutive_up_3d"])
             & (~day["has_shrink_limit_up_3d"])
             & (~day["is_limit_up"])
             & (day["pct_chg"] < self.chase_max_pct_chg)

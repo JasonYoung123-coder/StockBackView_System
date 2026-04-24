@@ -9,6 +9,11 @@ from app.backtest.engine import BacktestEngine
 from app.backtest.models import (
     BacktestJobCreateResponse,
     BacktestJobStatusResponse,
+    BacktestRecordFull,
+    BacktestRecordSummary,
+    ComparisonCurve,
+    ComparisonRequest,
+    ComparisonResponse,
     DailyHoldingDetail,
     DailyPositionDetail,
     BacktestRequest,
@@ -21,6 +26,7 @@ from app.backtest.models import (
 )
 from app.core.config import ConfigError, get_settings
 from app.services.backtest_jobs import job_store
+from app.services import backtest_storage
 from app.services.benchmark_service import BenchmarkService
 from app.services.market_data_service import MarketDataService
 from app.services.tushare_client import TushareClient
@@ -84,6 +90,14 @@ def _run_backtest_job(job_id: str, payload: BacktestRequest) -> None:
             ),
         )
         job_store.update(job_id, status="completed", progress=100, message="回测完成", result=result)
+        try:
+            backtest_storage.save_result(
+                payload.model_dump(mode="json"),
+                result.model_dump(mode="json"),
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning("回测结果自动保存失败", exc_info=True)
     except Exception as exc:
         job_store.update(job_id, status="failed", progress=100, message="回测失败", error=str(exc))
 
@@ -185,3 +199,89 @@ def _curve_points(frame: pd.DataFrame) -> list[CurvePoint]:
 def _update_progress(callback, progress: float, message: str) -> None:
     if callable(callback):
         callback(progress, message)
+
+
+# ── 回测历史记录 API ──────────────────────────────────────
+
+
+@router.get("/api/backtest/history", response_model=list[BacktestRecordSummary])
+async def list_backtest_history() -> list[BacktestRecordSummary]:
+    records = backtest_storage.list_records()
+    return [BacktestRecordSummary(**r) for r in records]
+
+
+@router.get("/api/backtest/history/{record_id}")
+async def get_backtest_record(record_id: str) -> BacktestRecordFull:
+    record = backtest_storage.get_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="未找到对应的回测记录。")
+    return BacktestRecordFull(**record)
+
+
+@router.delete("/api/backtest/history/{record_id}")
+async def delete_backtest_record(record_id: str) -> dict:
+    ok = backtest_storage.delete_record(record_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="未找到对应的回测记录。")
+    return {"deleted": True, "record_id": record_id}
+
+
+@router.post("/api/backtest/compare", response_model=ComparisonResponse)
+async def compare_backtest_records(payload: ComparisonRequest) -> ComparisonResponse:
+    curves: list[ComparisonCurve] = []
+    all_date_sets: list[set[str]] = []
+
+    for rid in payload.record_ids:
+        record = backtest_storage.get_record(rid)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"未找到回测记录: {rid}")
+
+        result = record.get("result", {})
+        req = record.get("request", {})
+        strategy_info = result.get("strategy", {})
+        strategy_name = strategy_info.get("name", req.get("strategy_name", "未知策略"))
+        start = result.get("start_date", req.get("start_date", ""))
+        end = result.get("end_date", req.get("end_date", ""))
+
+        strategy_curve = None
+        for c in result.get("curves", []):
+            if c.get("name", "").startswith("策略:") or c.get("name", "").startswith("策略："):
+                strategy_curve = c
+                break
+        if strategy_curve is None and result.get("curves"):
+            strategy_curve = result["curves"][0]
+
+        if strategy_curve is None:
+            raise HTTPException(status_code=400, detail=f"回测记录 {rid} 中未找到策略曲线。")
+
+        points = strategy_curve.get("points", [])
+        date_set = {p["date"] for p in points}
+        all_date_sets.append(date_set)
+
+        label = f"{strategy_name} ({start}~{end})"
+        curves.append(ComparisonCurve(
+            record_id=rid,
+            label=label,
+            points=[CurvePoint(**p) for p in points],
+        ))
+
+    if not all_date_sets:
+        raise HTTPException(status_code=400, detail="没有可对比的曲线数据。")
+
+    common_dates = all_date_sets[0]
+    for ds in all_date_sets[1:]:
+        common_dates = common_dates & ds
+
+    if not common_dates:
+        raise HTTPException(status_code=400, detail="所选回测记录的日期范围没有交集，无法对比。")
+
+    sorted_dates = sorted(common_dates)
+
+    for curve in curves:
+        curve.points = [p for p in curve.points if p.date in common_dates]
+        curve.points.sort(key=lambda p: p.date)
+
+    return ComparisonResponse(
+        curves=curves,
+        date_range={"start": sorted_dates[0], "end": sorted_dates[-1]},
+    )

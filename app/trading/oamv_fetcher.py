@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import datetime
 import logging
 import re
 import time
@@ -16,6 +17,8 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+
+from app.services.trading_calendar import TradingCalendarError, get_calendar
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +198,15 @@ class OAMVFetcher:
         Returns
         -------
         检测到的事件字符串（``"大涨"`` / ``"金叉"`` / ``"死叉"``），无事件返回 None。
+        非交易日(含法定节假日)直接返回 None,不写入任何行。
         """
+        try:
+            if not get_calendar().is_trading_day(datetime.date.today()):
+                logger.info("非交易日,跳过 OAMV 拉取")
+                return None
+        except TradingCalendarError as exc:
+            logger.warning("交易日历不可用,回退到继续拉取 OAMV: %s", exc)
+
         if self._df is None:
             self.load()
 

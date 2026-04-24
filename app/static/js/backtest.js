@@ -658,6 +658,7 @@ async function pollBacktestJob(jobId) {
     statusEl.textContent = `回测完成：${job.result.asset}，策略 ${job.result.strategy.name}`;
     submitButton.disabled = false;
     hideProgress();
+    loadHistory();
     return;
   }
 
@@ -738,4 +739,248 @@ window.addEventListener("resize", () => {
   }
 });
 
+// ═══════ 历史回测 & 策略对比 ═══════
+
+const historyListEl = document.getElementById("history-list");
+const refreshHistoryBtn = document.getElementById("refresh-history-btn");
+const loadHistoryBtn = document.getElementById("load-history-btn");
+const compareBtn = document.getElementById("compare-btn");
+const compareSectionEl = document.getElementById("compare-section");
+const compareChartEl = document.getElementById("compare-chart");
+const closeCompareBtn = document.getElementById("close-compare-btn");
+
+let historyRecords = [];
+let selectedRecordIds = new Set();
+let compareChart = null;
+
+function updateHistoryButtons() {
+  const count = selectedRecordIds.size;
+  if (loadHistoryBtn) loadHistoryBtn.disabled = count !== 1;
+  if (compareBtn) compareBtn.disabled = count < 2;
+}
+
+async function loadHistory() {
+  try {
+    const resp = await fetch("/api/backtest/history");
+    if (!resp.ok) return;
+    historyRecords = await resp.json();
+    selectedRecordIds.clear();
+    renderHistoryList(historyRecords);
+    updateHistoryButtons();
+  } catch (_) {}
+}
+
+function renderHistoryList(records) {
+  if (!historyListEl) return;
+  if (!records.length) {
+    historyListEl.innerHTML = `<div class="history-empty">暂无历史回测记录</div>`;
+    return;
+  }
+  historyListEl.innerHTML = records
+    .map((r) => {
+      const metrics = r.metrics || {};
+      const strategyMetrics = metrics["策略收益"] || {};
+      const totalReturn = strategyMetrics.total_return;
+      const returnText =
+        totalReturn !== undefined
+          ? `${totalReturn >= 0 ? "+" : ""}${(totalReturn * 100).toFixed(2)}%`
+          : "";
+      const returnClass =
+        totalReturn !== undefined ? (totalReturn >= 0 ? "profit" : "loss") : "";
+      const checked = selectedRecordIds.has(r.record_id) ? "checked" : "";
+      const selectedClass = selectedRecordIds.has(r.record_id) ? "selected" : "";
+      return `
+        <div class="history-item ${selectedClass}" data-record-id="${r.record_id}">
+          <input type="checkbox" ${checked} />
+          <div class="history-item-info">
+            <div class="history-item-title">${r.strategy_name}</div>
+            <div class="history-item-meta">${r.start_date} ~ ${r.end_date} · ${r.saved_at.slice(0, 16).replace("T", " ")}</div>
+          </div>
+          ${returnText ? `<span class="history-item-return ${returnClass}">${returnText}</span>` : ""}
+          <button class="btn-delete" title="删除">&times;</button>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+if (historyListEl) {
+  historyListEl.addEventListener("click", async (e) => {
+    const item = e.target.closest(".history-item");
+    if (!item) return;
+    const rid = item.dataset.recordId;
+
+    if (e.target.classList.contains("btn-delete")) {
+      if (!confirm("确定删除此回测记录？")) return;
+      try {
+        const resp = await fetch(`/api/backtest/history/${rid}`, { method: "DELETE" });
+        if (resp.ok) {
+          selectedRecordIds.delete(rid);
+          await loadHistory();
+        }
+      } catch (_) {}
+      return;
+    }
+
+    const cb = item.querySelector('input[type="checkbox"]');
+    if (e.target !== cb) {
+      cb.checked = !cb.checked;
+    }
+
+    if (cb.checked) {
+      selectedRecordIds.add(rid);
+      item.classList.add("selected");
+    } else {
+      selectedRecordIds.delete(rid);
+      item.classList.remove("selected");
+    }
+    updateHistoryButtons();
+  });
+}
+
+async function loadHistoryRecord(recordId) {
+  statusEl.textContent = "正在加载历史回测记录...";
+  try {
+    const resp = await fetch(`/api/backtest/history/${recordId}`);
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.detail || "加载失败");
+    }
+    const record = await resp.json();
+    const result = record.result;
+
+    closeCompareView();
+    clearPreviousResult();
+
+    if (backtestPlaceholderEl) backtestPlaceholderEl.classList.add("hidden");
+    if (chartEl) chartEl.classList.remove("hidden");
+
+    updateJobMeta("", result);
+    currentDailyPositionDetails = buildDailyPositionMap(result.daily_position_details);
+    renderMetrics(result.metrics);
+    renderSignalSummary(result.signal_summary);
+    renderTradeSummary(result.trade_summary);
+    currentTradeRecords = result.trade_records || [];
+    renderTradeRecords(currentTradeRecords);
+    renderChart(result.curves);
+    statusEl.textContent = `已加载历史记录：策略 ${result.strategy.name}（${result.start_date} ~ ${result.end_date}）`;
+  } catch (err) {
+    statusEl.textContent = `加载历史记录失败：${err.message}`;
+  }
+}
+
+async function compareRecords(recordIds) {
+  statusEl.textContent = "正在加载对比数据...";
+  if (compareBtn) compareBtn.disabled = true;
+
+  try {
+    const resp = await fetch("/api/backtest/compare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ record_ids: recordIds }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.detail || "对比失败");
+    }
+    const data = await resp.json();
+    renderCompareChart(data);
+    statusEl.textContent = `对比区间：${data.date_range.start} ~ ${data.date_range.end}，共 ${data.curves.length} 条策略`;
+  } catch (err) {
+    statusEl.textContent = `对比失败：${err.message}`;
+  } finally {
+    updateHistoryButtons();
+  }
+}
+
+function renderCompareChart(data) {
+  if (!compareSectionEl || !compareChartEl) return;
+  compareSectionEl.classList.remove("hidden");
+
+  if (!compareChart && window.echarts) {
+    compareChart = echarts.init(compareChartEl);
+  }
+  if (!compareChart) return;
+
+  const dates = data.curves[0]?.points.map((p) => p.date) || [];
+  const colors = ["#1d4ed8", "#dc2626", "#16a34a", "#d97706", "#7c3aed", "#0891b2", "#be185d", "#65a30d", "#0369a1", "#a16207"];
+
+  const series = data.curves.map((curve, i) => ({
+    name: curve.label,
+    type: "line",
+    smooth: true,
+    showSymbol: false,
+    lineStyle: { width: 2.5 },
+    itemStyle: { color: colors[i % colors.length] },
+    data: curve.points.map((p) => p.value),
+  }));
+
+  compareChart.setOption(
+    {
+      tooltip: {
+        trigger: "axis",
+        formatter: (params) => {
+          if (!Array.isArray(params) || !params.length) return "";
+          const lines = [params[0].axisValue];
+          params.forEach((item) => {
+            const val = Number(item.value);
+            const pct = ((val - 1) * 100).toFixed(2);
+            lines.push(`${item.marker}${item.seriesName}：${pct}%`);
+          });
+          return lines.join("<br/>");
+        },
+      },
+      legend: {
+        top: 8,
+        textStyle: { color: "#334155", fontSize: 12 },
+      },
+      grid: { left: 48, right: 24, top: 56, bottom: 32 },
+      xAxis: { type: "category", data: dates },
+      yAxis: {
+        type: "value",
+        axisLabel: {
+          formatter: (v) => `${((v - 1) * 100).toFixed(0)}%`,
+        },
+      },
+      series,
+    },
+    true,
+  );
+}
+
+function closeCompareView() {
+  if (compareSectionEl) compareSectionEl.classList.add("hidden");
+  if (compareChart) {
+    compareChart.clear();
+  }
+}
+
+if (closeCompareBtn) {
+  closeCompareBtn.addEventListener("click", closeCompareView);
+}
+
+if (refreshHistoryBtn) {
+  refreshHistoryBtn.addEventListener("click", loadHistory);
+}
+
+if (loadHistoryBtn) {
+  loadHistoryBtn.addEventListener("click", () => {
+    const id = [...selectedRecordIds][0];
+    if (id) loadHistoryRecord(id);
+  });
+}
+
+if (compareBtn) {
+  compareBtn.addEventListener("click", () => {
+    if (selectedRecordIds.size >= 2) {
+      compareRecords([...selectedRecordIds]);
+    }
+  });
+}
+
+window.addEventListener("resize", () => {
+  if (compareChart) compareChart.resize();
+});
+
 loadStrategies();
+loadHistory();

@@ -27,6 +27,9 @@ class TushareClient:
     def get_index_daily(self, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         return self._get_timeseries("index_daily", ts_code, start_date, end_date)
 
+    def get_fund_daily(self, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        return self._get_timeseries("fund_daily", ts_code, start_date, end_date)
+
     def get_trade_calendar(self, start_date: str, end_date: str) -> pd.DataFrame:
         cache_file = self.settings.cache_dir / "calendar" / "trade_calendar.csv"
         cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -50,7 +53,7 @@ class TushareClient:
             exchange="SSE",
             start_date=start_date,
             end_date=end_date,
-            fields="cal_date,is_open",
+            fields="cal_date,is_open,pretrade_date",
         )
         if frame is None or frame.empty:
             raise RuntimeError("未获取到交易日历数据。")
@@ -395,6 +398,8 @@ class TushareClient:
 
         if kind == "stock_daily":
             fetcher = self.client.daily
+        elif kind == "fund_daily":
+            fetcher = self.client.fund_daily
         else:
             fetcher = self.client.index_daily
         try:

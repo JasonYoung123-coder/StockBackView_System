@@ -8,17 +8,20 @@ from app.strategy.base import BaseStrategy
 
 
 class Strategy(BaseStrategy):
-    """基于 N 日放量上涨后缩量回调模式选股的量化回测策略。
+    """基于 N 日放量上涨后缩量回调模式选股的量化回测策略（劲帆线强化版）。
 
-    选股逻辑（源自 stock_selector_Nframe.py，含宽松回调优化）:
+    选股逻辑（源自 stock_selector_Nframe.py，含宽松回调优化 + 劲帆线过滤）:
     - 5 日模式：第 1 日放量 >100% 且涨幅 ≥3.8%，随后 4 日连续缩量，
       其中至少 3 日下跌，允许 1 日小幅上涨（涨幅 <1.5%），
       T+1 成交量缩至放量日的 50% 以下
     - 4 日模式：同理，随后 3 日连续缩量，其中至少 2 日下跌
     - 优先买入 5 日模式股票
+    - 评分 ≥5 分且放量日量比得分 ≥1 分（量比 >2 倍）
+    - 劲帆小弟线（EMA(EMA(close,10),10)）须大于大哥线（4均线均值），
+      且当日小弟线须大于前一交易日小弟线（趋势上升）
 
     风控规则：
-    - 止损：收盘价破近 N 个交易日最低点，次日开盘卖出
+    - 止损：连续2日收盘价低于劲帆大哥线，且收盘价破近 N 个交易日最低点，次日开盘卖出
     - 止盈：成交量创近 30 日新高且盈利筹码占比 >99%（参考 2.0.3 筹码逻辑），
       按收盘价-0.01 卖出
     - 调仓：持仓满 N 个交易日且收益率低于阈值，卖出并买入当日可选标的
@@ -29,10 +32,10 @@ class Strategy(BaseStrategy):
     - 剔除近 10 个交易日累计换手率超过 30% 的股票
     """
 
-    name = "Nframe选股回测策略v1.0.4高分严选"
+    name = "Nframe选股回测策略v1.0.5劲帆线强化"
     description = (
         "基于放量缩量回调模式选股（5日/4日），"
-        "仅买入评分≥8分的高质量候选，含止损止盈调仓。"
+        "评分≥5分且量比得分≥1分，需满足劲帆小弟线>大哥线且小弟线上升，含止损止盈调仓。"
     )
     is_portfolio_strategy = True
     lookback_days = 120
@@ -53,7 +56,7 @@ class Strategy(BaseStrategy):
         pattern_shrink_ratio: float = 0.5,
         pattern_max_up_days: int = 1,
         pattern_max_up_pct: float = 1.5,
-        min_buy_score: int = 8,
+        min_buy_score: int = 5,
     ) -> None:
         self.max_holdings = int(max_holdings)
         self.position_per_stock = 1.0 / max(self.max_holdings, 1)
@@ -187,18 +190,21 @@ class Strategy(BaseStrategy):
                 cur_vol = sc["vol"][ri]
                 sig = f"{ts_code}|{trade_date.strftime('%Y-%m-%d')}"
 
-                # ── 止损：连续2天收盘价跌破近N日最低点 ──
+                # ── 止损：连续2日收盘价低于劲帆大哥线 且 收盘价破近N日最低点 ──
                 sl_start = max(0, ri - self.stop_loss_lookback)
                 if ri - sl_start >= self.stop_loss_lookback and ri >= 2:
-                    min_low = float(np.nanmin(sc["low"][sl_start:ri]))
-                    prev_min_low = float(np.nanmin(sc["low"][max(0, ri - 1 - self.stop_loss_lookback):ri - 1]))
-                    if cur_close < min_low and sc["close"][ri - 1] < prev_min_low:
-                        sell_reasons[sig] = "止损-连续2日收盘价破近N日最低点"
-                        holdings.pop(ts_code)
-                        self._cleanup_chips(ts_code)
-                        sold_today.add(ts_code)
-                        rebalance_count += 1
-                        continue
+                    ls_cur = sc["longshort_line"][ri]
+                    ls_prev = sc["longshort_line"][ri - 1]
+                    if (not np.isnan(ls_cur) and not np.isnan(ls_prev)
+                            and cur_close < ls_cur and sc["close"][ri - 1] < ls_prev):
+                        min_low = float(np.nanmin(sc["low"][sl_start:ri]))
+                        if cur_close < min_low:
+                            sell_reasons[sig] = "止损-连续2日低于大哥线且破近N日最低点"
+                            holdings.pop(ts_code)
+                            self._cleanup_chips(ts_code)
+                            sold_today.add(ts_code)
+                            rebalance_count += 1
+                            continue
 
                 # ── 止盈 ──
                 tp_start = max(0, ri + 1 - self.tp_volume_lookback)
@@ -315,6 +321,18 @@ class Strategy(BaseStrategy):
         else:
             frame["tr_10d"] = 0.0
 
+        # 劲帆小弟线: EMA(EMA(close, 10), 10)
+        _ema10 = _gt("close", lambda s: s.ewm(span=10, adjust=False).mean())
+        frame["short_trend"] = _ema10.groupby(ts_col, sort=False).transform(
+            lambda s: s.ewm(span=10, adjust=False).mean()
+        )
+
+        # 劲帆大哥线: (MA(14) + MA(28) + MA(57) + MA(114)) / 4
+        _ma_sum = pd.Series(0.0, index=frame.index, dtype=float)
+        for period in (14, 28, 57, 114):
+            _ma_sum = _ma_sum + _gt("close", lambda s, p=period: s.rolling(p).mean())
+        frame["longshort_line"] = _ma_sum / 4
+
     # ═══════════════════════ 模式预计算 ═══════════════════════
 
     def _precompute_patterns(
@@ -430,6 +448,8 @@ class Strategy(BaseStrategy):
                 "close_unadj": group["close_unadj"].values.astype(float) if "close_unadj" in group.columns else group["close"].values.astype(float),
                 "amp_10d": group["amp_10d"].values.astype(float) if "amp_10d" in group.columns else np.full(n, np.inf),
                 "tr_10d": group["tr_10d"].values.astype(float) if "tr_10d" in group.columns else np.zeros(n),
+                "short_trend": group["short_trend"].values.astype(float) if "short_trend" in group.columns else np.full(n, np.nan),
+                "longshort_line": group["longshort_line"].values.astype(float) if "longshort_line" in group.columns else np.full(n, np.nan),
             }
         return cache
 
@@ -472,8 +492,20 @@ class Strategy(BaseStrategy):
             cp = sc["close"][ri]
             if np.isnan(cp) or cp <= 0:
                 continue
-            score = self._score_candidate(detail, sc["kdj_j"][ri])
+            score, vol_score = self._score_candidate(detail, sc["kdj_j"][ri])
             if score < self.min_buy_score:
+                continue
+            if vol_score < 1:
+                continue
+            # 劲帆线条件：小弟线 > 大哥线，且今日小弟线 > 昨日小弟线
+            st_today = sc["short_trend"][ri]
+            ls_today = sc["longshort_line"][ri]
+            if np.isnan(st_today) or np.isnan(ls_today) or st_today <= ls_today:
+                continue
+            if ri < 1:
+                continue
+            st_prev = sc["short_trend"][ri - 1]
+            if np.isnan(st_prev) or st_today <= st_prev:
                 continue
             candidates.append({"ts_code": ts_code, "close_price": float(cp), "score": score, "pattern": pattern})
         candidates.sort(key=lambda x: (-x["score"], x["pattern"] != "5日", x["close_price"]))
@@ -482,7 +514,8 @@ class Strategy(BaseStrategy):
     # ═══════════════════════ 候选评分 ═══════════════════════
 
     @staticmethod
-    def _score_candidate(detail: dict, kdj_j: float) -> int:
+    def _score_candidate(detail: dict, kdj_j: float) -> tuple[int, int]:
+        """返回 (总评分, 量比子评分)。"""
         score = 0
         shrink = detail["day2_shrink_ratio"]
         if shrink < 0.30:
@@ -501,16 +534,18 @@ class Strategy(BaseStrategy):
             score += 2
         elif pct > 5.0:
             score += 1
+        vol_score = 0
         vol_ratio = detail["day1_vol_ratio"]
         if vol_ratio > 5.0:
-            score += 4
+            vol_score = 4
         elif vol_ratio > 4.0:
-            score += 3
+            vol_score = 3
         elif vol_ratio > 3.0:
-            score += 2
-        elif vol_ratio > 2.5:
-            score += 1
-        return score
+            vol_score = 2
+        elif vol_ratio > 2.0:
+            vol_score = 1
+        score += vol_score
+        return score, vol_score
 
     # ═══════════════════════ 筹码数据（惰性加载） ═══════════════════════
 

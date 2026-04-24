@@ -1,4 +1,45 @@
 {
-  "positions": {},
-  "updated_at": ""
+  "positions": {
+    "603387.SH": {
+      "ts_code": "603387.SH",
+      "name": "基蛋生物",
+      "buy_date": "2026-04-15",
+      "buy_price": 9.9,
+      "source": "strategy",
+      "score": 7
+    },
+    "002594.SZ": {
+      "ts_code": "002594.SZ",
+      "name": "比亚迪",
+      "buy_date": "2026-04-10",
+      "buy_price": 99.43,
+      "source": "strategy",
+      "score": 7
+    },
+    "300866.SZ": {
+      "ts_code": "300866.SZ",
+      "name": "安克创新",
+      "buy_date": "2026-04-10",
+      "buy_price": 107.219,
+      "source": "strategy",
+      "score": 7
+    },
+    "600066.SH": {
+      "ts_code": "600066.SH",
+      "name": "宇通客车",
+      "buy_date": "2026-04-16",
+      "buy_price": 36.417,
+      "source": "strategy",
+      "score": 7
+    },
+    "688019.SH": {
+      "ts_code": "688019.SH",
+      "name": "安集科技",
+      "buy_date": "2026-04-17",
+      "buy_price": 253.986,
+      "source": "strategy",
+      "score": 7
+    }
+  },
+  "updated_at": "2026-04-17 12:00:00"
 }

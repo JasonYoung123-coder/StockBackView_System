@@ -10,10 +10,11 @@ from app.strategy.base import BaseStrategy
 
 
 class Strategy(BaseStrategy):
-    name = "劲帆量化模型2.0.3"
+    name = "劲帆量化模型3.0.3长线均线择时"
     description = (
         "基于劲帆小弟线和KDJ指标选股，仅买入7分满分股票，"
         "结合活跃市值状态优化持仓节奏，跌破大哥线止损，放量滞涨止盈，最多持仓5只。"
+        "熊市区间KDJ J<30全仓买入国债ETF，J>115卖出一半，J<30再买回，波段操作。"
     )
     is_portfolio_strategy = True
     lookback_days = 200
@@ -53,15 +54,22 @@ class Strategy(BaseStrategy):
     oamv_daily_file = Path(__file__).resolve().parents[1] / "analysis" / "OAMV.XLSX"
     chips_fallback_file = Path(__file__).resolve().parents[1] / "analysis" / "chips_data.xlsx"
 
+    # ── 牛熊择时参数 ──
+    SH_INDEX_CODE = "000001.SH"
+    BEAR_STOCK_CODE = "511260.SH"
+    BEAR_STOCK_NAME = "10年期国债ETF"
+    BEAR_POSITION_RATIO = 0.0
+    BEAR_STOCK_POSITION = 1.0
+    BEAR_STOCK_HALF_POSITION = 0.5
+    BEAR_STOCK_MIN_WEIGHT = 0.005
+    BEAR_KDJ_BUY_J = 30.0
+    BEAR_KDJ_SELL_J = 115.0
+
     # ── 实盘模式标记（由 generate_live_signals 设置） ──
     _live_execution_mode: bool = False
     _realtime_prices: dict[str, dict] = {}
     _live_trade_start_date: pd.Timestamp | None = None
     _qmt_held_codes: set[str] | None = None
-    _adopted_positions: dict[str, dict] = {}
-    _skip_score_replace: bool = False
-    _enable_diagnostics: bool = False
-    _diagnostics: list[str] = []
 
     # ─────────────────── 实盘交易入口 ───────────────────
 
@@ -73,8 +81,6 @@ class Strategy(BaseStrategy):
         *,
         live_start_date: str | pd.Timestamp | None = None,
         qmt_held_codes: set[str] | None = None,
-        adopted_positions: dict[str, dict] | None = None,
-        skip_score_replace: bool = False,
     ) -> dict:
         """实盘交易模式：使用实时行情生成买卖信号。
 
@@ -85,16 +91,10 @@ class Strategy(BaseStrategy):
         - qmt_held_codes：QMT 实际持仓代码集合。传入后，策略在最后一天
           会对比内部模拟持仓与 QMT 实际持仓，自动清除"幻影持仓"
           （策略以为持有但 QMT 已无）以释放仓位给新候选股。
-        - adopted_positions：手动买入后被策略接管的持仓。注入到 holdings 中，
-          使其接受止损/止盈/调仓管理。
-        - skip_score_replace：跳过7分股替换亏损低分持仓逻辑（下午盘中数据不完整时使用）。
         """
         self._live_execution_mode = True
         self._realtime_prices = realtime_prices
         self._qmt_held_codes = qmt_held_codes
-        self._adopted_positions = adopted_positions or {}
-        self._skip_score_replace = skip_score_replace
-        self._diagnostics = []
         if live_start_date is not None:
             self._live_trade_start_date = pd.Timestamp(live_start_date).normalize()
         else:
@@ -106,24 +106,16 @@ class Strategy(BaseStrategy):
             self._realtime_prices = {}
             self._live_trade_start_date = None
             self._qmt_held_codes = None
-            self._adopted_positions = {}
-            self._skip_score_replace = False
 
         last_date = weights.index[-1] if not weights.empty else None
         last_date_str = last_date.strftime("%Y-%m-%d") if last_date else ""
-        prev_date = self._get_prev_trade_date(last_date) if last_date is not None else None
-        prev_date_str = prev_date.strftime("%Y-%m-%d") if prev_date else ""
-        recent_dates = {last_date_str, prev_date_str} - {""}
 
         buy_signals: list[dict] = []
         sell_signals: list[dict] = []
-        seen_buy_codes: set[str] = set()
 
-        seen_sell_codes: set[str] = set()
         for key, reason in meta.get("sell_reasons", {}).items():
             ts_code, date_str = key.split("|", 1)
-            if date_str in recent_dates and ts_code not in seen_sell_codes:
-                seen_sell_codes.add(ts_code)
+            if date_str == last_date_str:
                 price = meta.get("sell_prices", {}).get(key, 0.0)
                 if price <= 0 and ts_code in realtime_prices:
                     price = realtime_prices[ts_code].get("latest_price", 0.0)
@@ -133,35 +125,19 @@ class Strategy(BaseStrategy):
                     "price": price,
                 })
 
-        # 买入信号：优先使用当日最新数据筛选的候选（基于 QMT 实际持仓），
-        # 确保即便错过了最初的买入窗口，也能选到当日最优标的。
-        # 仅当 fresh_buy_candidates 为空时（如非实盘模式），才回退到历史 buy_prices。
-        fresh = meta.get("fresh_buy_candidates", [])
-        if fresh:
-            for item in fresh:
-                ts_code = item["ts_code"]
-                if ts_code not in seen_buy_codes:
-                    seen_buy_codes.add(ts_code)
-                    buy_signals.append({
-                        "ts_code": ts_code,
-                        "price": item["price"],
-                    })
-        else:
-            for key, price in meta.get("buy_prices", {}).items():
-                ts_code, date_str = key.split("|", 1)
-                if date_str in recent_dates and ts_code not in seen_buy_codes:
-                    seen_buy_codes.add(ts_code)
-                    buy_signals.append({
-                        "ts_code": ts_code,
-                        "price": price,
-                    })
+        for key, price in meta.get("buy_prices", {}).items():
+            ts_code, date_str = key.split("|", 1)
+            if date_str == last_date_str:
+                buy_signals.append({
+                    "ts_code": ts_code,
+                    "price": price,
+                })
 
         return {
             "sell_signals": sell_signals,
             "buy_signals": buy_signals,
             "holdings": meta.get("latest_holdings", []),
             "warnings": meta.get("warnings", []),
-            "diagnostics": list(self._diagnostics),
         }
 
     # ─────────────────────── 主入口 ───────────────────────
@@ -186,6 +162,13 @@ class Strategy(BaseStrategy):
         }
 
         self._tushare = TushareClient()
+
+        trade_index = pd.DatetimeIndex(trade_dates)
+
+        self._bear_etf_data = self._fetch_bear_etf_data(trade_index)
+        if self._bear_etf_data is not None and not self._bear_etf_data.empty:
+            self._stock_groups[self.BEAR_STOCK_CODE] = self._bear_etf_data.copy()
+
         self._chips_cache: dict[str, pd.DataFrame] = {}
         self._chips_fetched_end: dict[str, str] = {}
         self._chips_missing_attempts: dict[str, set[str]] = {}
@@ -194,7 +177,6 @@ class Strategy(BaseStrategy):
         self._warnings: list[str] = []
         self._warning_keys: set[str] = set()
 
-        trade_index = pd.DatetimeIndex(trade_dates)
         self._backtest_start_date = pd.Timestamp(trade_index.min()).normalize()
         self._backtest_end_date = pd.Timestamp(trade_index.max()).normalize()
         self._trade_dates_list: list[pd.Timestamp] = list(trade_index)
@@ -202,9 +184,23 @@ class Strategy(BaseStrategy):
             d: i for i, d in enumerate(self._trade_dates_list)
         }
         self._oamv_regime = self._load_oamv_regime(trade_index)
+
+        self.report_progress(57, "正在获取牛熊择时数据")
+        try:
+            self._market_regime = self._fetch_and_build_market_regime(trade_index)
+        except Exception as exc:
+            self._warnings.append(f"获取牛熊择时数据失败，使用默认牛市状态: {exc}")
+            self._market_regime = pd.Series("牛市", index=trade_index, dtype="object")
+        self._bear_stock_holding: dict | None = None
+        self._bear_stock_last_reduce_signal_date: pd.Timestamp | None = None
+        self._prev_market_regime: str = "牛市"
+        self._bear_period_trimmed: bool = False
+
         date_to_idx: dict[pd.Timestamp, int] = self._date_to_list_idx
         all_codes = sorted(prepared["ts_code"].unique())
         weights = pd.DataFrame(0.0, index=trade_index, columns=all_codes)
+        if self.BEAR_STOCK_CODE not in weights.columns:
+            weights[self.BEAR_STOCK_CODE] = 0.0
 
         holdings: dict[str, dict] = {}
         latest_holdings: list[dict] = []
@@ -219,12 +215,13 @@ class Strategy(BaseStrategy):
             progress = 60.0 + (idx / total_days) * 30.0
             self.report_progress(progress, f"正在执行策略回测 {idx}/{total_days}")
             oamv_regime = self._get_oamv_regime(trade_date)
+            market_regime = self._get_market_regime(trade_date)
 
-            # 实盘模式：起始日之前不建仓，跳过买卖逻辑
             if (
                 self._live_trade_start_date is not None
                 and pd.Timestamp(trade_date).normalize() < self._live_trade_start_date
             ):
+                self._prev_market_regime = market_regime
                 continue
 
             # ── 实盘模式：最后一天对齐 QMT 实际持仓 ──
@@ -243,36 +240,29 @@ class Strategy(BaseStrategy):
                     self._chips_cache.pop(ts_code, None)
                     self._chips_fetched_end.pop(ts_code, None)
                     self._chips_missing_attempts.pop(ts_code, None)
+                if (
+                    self._bear_stock_holding is not None
+                    and self.BEAR_STOCK_CODE not in self._qmt_held_codes
+                ):
+                    self._add_warning(
+                        self.BEAR_STOCK_CODE, trade_date,
+                        f"检测到手动卖出：策略模拟仍持有{self.BEAR_STOCK_NAME}但QMT已无此持仓，已自动释放仓位",
+                    )
+                    self._bear_stock_holding = None
 
-                # ── 注入持仓注册表中的持仓（phantom 清理之后、卖出判断之前） ──
-                if self._adopted_positions:
-                    for a_code, a_info in self._adopted_positions.items():
-                        if a_code in self._qmt_held_codes and a_code not in holdings:
-                            source = a_info.get("source", "manual")
-                            # score 决定是否会被 7 分新股替换：>= buy_score_threshold 时受保护。
-                            # 默认回退到阈值，使接管持仓默认不参与"亏损低分股替换"。
-                            try:
-                                injected_score = float(a_info.get("score", self.buy_score_threshold))
-                            except (TypeError, ValueError):
-                                injected_score = float(self.buy_score_threshold)
-                            holdings[a_code] = {
-                                "ts_code": a_code,
-                                "name": a_info.get("name", ""),
-                                "industry": "未知",
-                                "score": injected_score,
-                                "selection_reason": "手动买入-策略接管" if source == "manual" else "持仓注册-策略重建",
-                                "buy_date": pd.Timestamp(a_info["buy_date"]),
-                                "buy_price": a_info["buy_price"],
-                                "weight": self.position_per_stock,
-                            }
-                            label = "手动持仓已接管" if source == "manual" else "注册持仓已重建"
-                            self._add_warning(
-                                a_code, trade_date,
-                                f"{label}: "
-                                f"买入日{a_info['buy_date']} "
-                                f"买入价{a_info['buy_price']:.2f} "
-                                f"评分{injected_score:.0f}",
-                            )
+            # ── 牛熊转换调仓 ──
+            if self._prev_market_regime != "熊市" and market_regime == "熊市":
+                self._bear_period_trimmed = False
+            if market_regime == "熊市" and not self._bear_period_trimmed:
+                if holdings:
+                    self._handle_bull_to_bear_transition(
+                        trade_date, holdings, sell_reasons, sell_prices,
+                    )
+                self._bear_period_trimmed = True
+            elif self._prev_market_regime == "熊市" and market_regime == "牛市":
+                self._handle_bear_to_bull_transition(
+                    trade_date, holdings, sell_reasons, sell_prices, buy_prices,
+                )
 
             # ── 卖出判断 ──
             for ts_code in list(holdings.keys()):
@@ -299,52 +289,63 @@ class Strategy(BaseStrategy):
                 if forced_exit > 0:
                     rebalance_count += 1
 
-            # ── 买入判断 ──
-            if oamv_regime != "死叉" and len(holdings) < self.max_holdings:
+            # ── 国债ETF：止损检查 + KDJ卖出一半检查 ──
+            if self._bear_stock_holding is not None:
+                self._check_bear_stock_stop_loss(trade_date, sell_reasons, sell_prices)
+            if self._bear_stock_holding is not None:
+                self._check_bear_stock_kdj_sell_half(trade_date, sell_reasons, sell_prices)
+
+            # ── 买入判断（熊市不买入股票） ──
+            if market_regime != "熊市" and oamv_regime != "死叉" and len(holdings) < self.max_holdings:
                 added = self._fill_positions(prepared, trade_date, holdings, buy_prices, oamv_regime)
                 if added > 0:
                     rebalance_count += 1
 
-            # ── 持仓优化：满仓时替换持仓久且浮盈低的股票 ──
-            if oamv_regime != "死叉":
-                if len(holdings) >= self.max_holdings:
-                    replaced = self._try_replace_holdings(
-                        prepared, trade_date, holdings, sell_reasons, date_to_idx, buy_prices, oamv_regime,
+            # ── 持仓优化：满仓时替换持仓久且浮盈低的股票（熊市不执行） ──
+            if market_regime != "熊市":
+                if oamv_regime != "死叉":
+                    if len(holdings) >= self.max_holdings:
+                        replaced = self._try_replace_holdings(
+                            prepared, trade_date, holdings, sell_reasons, date_to_idx, buy_prices, oamv_regime,
+                        )
+                        if replaced > 0:
+                            rebalance_count += 1
+                elif holdings:
+                    reduced = self._reduce_holdings_on_dead_cross(
+                        prepared, trade_date, holdings, sell_reasons, date_to_idx,
                     )
-                    if replaced > 0:
+                    if reduced > 0:
                         rebalance_count += 1
-            elif holdings:
-                reduced = self._reduce_holdings_on_dead_cross(
-                    prepared, trade_date, holdings, sell_reasons, date_to_idx,
-                )
-                if reduced > 0:
-                    rebalance_count += 1
 
-            # ── 写入权重 ──
-            for ts_code in holdings:
-                weights.loc[trade_date, ts_code] = self.position_per_stock
+            # ── 熊市：国债ETF买入检查 ──
+            if market_regime == "熊市":
+                self._check_bear_stock_buy(trade_date, buy_prices)
+
+            # ── 写入权重（根据牛熊状态调整仓位） ──
+            if market_regime == "熊市":
+                if self._bear_stock_holding and self._bear_stock_holding["weight"] > self.BEAR_STOCK_MIN_WEIGHT:
+                    weights.loc[trade_date, self.BEAR_STOCK_CODE] = self._bear_stock_holding["weight"]
+            else:
+                for ts_code in holdings:
+                    weights.loc[trade_date, ts_code] = self.position_per_stock
+                if self._bear_stock_holding and self._bear_stock_holding["weight"] > self.BEAR_STOCK_MIN_WEIGHT:
+                    key = f"{self.BEAR_STOCK_CODE}|{trade_date.strftime('%Y-%m-%d')}"
+                    sell_reasons[key] = f"牛市调仓-卖出{self.BEAR_STOCK_NAME}"
+                    bp = self._get_bear_stock_price(trade_date)
+                    if bp is not None:
+                        sell_prices[key] = bp
+                    self._bear_stock_holding = None
+
+            self._prev_market_regime = market_regime
             latest_holdings = self._build_latest_holdings(holdings)
-
-        # ── 实盘模式：基于当日最新数据 + QMT 实际持仓重新筛选买入候选 ──
-        # 避免输出历史模拟中前几天买入的标的，确保买入信号始终是当日最优选
-        fresh_buy_candidates: list[dict] = []
-        if self._live_execution_mode and self._qmt_held_codes is not None and trade_index.size > 0:
-            last_td = trade_index[-1]
-            oamv_regime = self._get_oamv_regime(last_td)
-            qmt_holdings_proxy = {code: {} for code in self._qmt_held_codes}
-            self._enable_diagnostics = True
-            fresh = self._build_fill_candidates(prepared, last_td, qmt_holdings_proxy, oamv_regime)
-            self._enable_diagnostics = False
-            if not fresh.empty:
-                for row in fresh.itertuples():
-                    exec_date, exec_price = self._get_buy_execution(row.ts_code, last_td)
-                    if exec_date is not None and exec_price is not None:
-                        fresh_buy_candidates.append({
-                            "ts_code": row.ts_code,
-                            "name": getattr(row, "name", ""),
-                            "score": float(row.score),
-                            "price": exec_price,
-                        })
+            if self._bear_stock_holding and self._bear_stock_holding["weight"] > self.BEAR_STOCK_MIN_WEIGHT:
+                latest_holdings.append({
+                    "ts_code": self.BEAR_STOCK_CODE,
+                    "name": self.BEAR_STOCK_NAME,
+                    "industry": "国债ETF",
+                    "score": 0,
+                    "selection_reason": "熊市防御仓位",
+                })
 
         return weights, {
             "rebalance_count": rebalance_count,
@@ -353,8 +354,8 @@ class Strategy(BaseStrategy):
             "sell_prices": sell_prices,
             "sell_orders": sell_orders,
             "buy_prices": buy_prices,
-            "fresh_buy_candidates": fresh_buy_candidates,
             "warnings": self._warnings,
+            "supplementary_market_data": self._bear_etf_data,
         }
 
     # ─────────────────────── 数据预处理 ───────────────────────
@@ -431,14 +432,10 @@ class Strategy(BaseStrategy):
         # ── 近30日最低价 (用于止损) ──
         frame["low_30d"] = _gt("low", lambda s: s.rolling(self.stop_loss_low_lookback, min_periods=1).min())
 
-        # ── 近20日振幅: (最高价 - 最低价) / 第21个交易日前收盘价 ──
+        # ── 近20日振幅: (最高价 - 最低价) / 最低价 (用于排除异常波动股) ──
         _high_20d = _gt("high", lambda s: s.rolling(20, min_periods=20).max())
         _low_20d = _gt("low", lambda s: s.rolling(20, min_periods=20).min())
-        _close_prev21 = _gt("close", lambda s: s.shift(20))
-        frame["high_20d"] = _high_20d
-        frame["low_20d"] = _low_20d
-        frame["close_prev21"] = _close_prev21
-        frame["amplitude_20d"] = ((_high_20d - _low_20d) / _close_prev21.replace(0.0, pd.NA)).fillna(0.0)
+        frame["amplitude_20d"] = ((_high_20d - _low_20d) / _low_20d.replace(0.0, pd.NA)).fillna(0.0)
 
         # ── 成交量日变化率 (用于评分3) ──
         frame["vol_pct_change"] = _gt("vol", lambda s: s.pct_change()).fillna(0.0)
@@ -509,20 +506,8 @@ class Strategy(BaseStrategy):
         if len(recent) < 2:
             return False, "", None
 
-        # ── 止损: 连续N天收盘价 < 劲帆大哥线 且 < 前30日最低价 ──
-        # low_30d 包含当天最低价，而 low <= close 恒成立，
-        # 所以取前一天的 low_30d 作为参考值来排除当天。
-        n = self.stop_loss_consecutive_days
-        if len(recent) >= n + 1:
-            tail = recent.tail(n)
-            if tail["longshort_line"].notna().all():
-                below_longshort = tail["close"].values < tail["longshort_line"].values
-                if below_longshort.all():
-                    ref = recent.iloc[-(n + 1):-1]
-                    if ref["low_30d"].notna().all():
-                        below_low_ref = tail["close"].values < ref["low_30d"].values
-                        if below_low_ref.all():
-                            return True, "止损-跌破大哥线及近期低点", None
+        if self._hit_stop_loss(recent):
+            return True, "止损-跌破大哥线及近期低点", None
 
         # ── 止盈: 盈利筹码占比 > 99% 且成交量为近30日最高 ──
         latest = recent.iloc[-1]
@@ -544,7 +529,7 @@ class Strategy(BaseStrategy):
                 self._add_warning(
                     ts_code,
                     trade_date,
-                    "止盈判断缺少当日筹码数据，已跳过“获利筹码占比”检查",
+                    '止盈判断缺少当日筹码数据，已跳过"获利筹码占比"检查',
                 )
             if today_ratio is not None and today_ratio > threshold:
                 tp_price = close_price if self._live_execution_mode else close_price - 0.01
@@ -567,7 +552,7 @@ class Strategy(BaseStrategy):
                     self._add_warning(
                         ts_code,
                         prev["trade_date"],
-                        "止盈判断缺少前一日筹码数据，已跳过“前一日获利筹码占比”检查",
+                        '止盈判断缺少前一日筹码数据，已跳过"前一日获利筹码占比"检查',
                     )
                 if prev_ratio is not None and prev_ratio > self.take_profit_prev_day_threshold:
                     tp_price2 = close_price if self._live_execution_mode else close_price - 0.01
@@ -581,6 +566,22 @@ class Strategy(BaseStrategy):
                 )
 
         return False, "", None
+
+    def _hit_stop_loss(self, recent: pd.DataFrame) -> bool:
+        n = self.stop_loss_consecutive_days
+        if len(recent) < n + 1:
+            return False
+        tail = recent.tail(n)
+        if not tail["longshort_line"].notna().all():
+            return False
+        below_longshort = tail["close"].values < tail["longshort_line"].values
+        if not below_longshort.all():
+            return False
+        ref = recent.iloc[-(n + 1):-1]
+        if not ref["low_30d"].notna().all():
+            return False
+        below_low_ref = tail["close"].values < ref["low_30d"].values
+        return bool(below_low_ref.all())
 
     # ─────────────────────── 买入逻辑 ───────────────────────
 
@@ -606,11 +607,6 @@ class Strategy(BaseStrategy):
                 continue
             execution_date, execution_price = self._get_buy_execution(row.ts_code, trade_date)
             if execution_date is None or execution_price is None:
-                self._add_warning(
-                    row.ts_code, trade_date,
-                    f"候选标的(评分{float(row.score):.0f})无法获取买入成交价，"
-                    f"可能原因: 实盘模式下 realtime_prices 缺失该标的，或无次日行情数据",
-                )
                 continue
             holdings[row.ts_code] = {
                 "ts_code": row.ts_code,
@@ -700,7 +696,6 @@ class Strategy(BaseStrategy):
 
         held = set(holdings.keys())
 
-        # 向量化预筛选：一次性排除绝大部分不符合条件的股票
         mask = (
             (~day["ts_code"].isin(held))
             & (day["short_trend"].notna())
@@ -714,15 +709,9 @@ class Strategy(BaseStrategy):
             & (day["amplitude_20d"] <= 0.40)
         )
         c = day.loc[mask].copy()
-
-        # ── 实盘诊断：记录被各条件淘汰的高分股票 ──
-        if self._enable_diagnostics and min_score is None:
-            self._diagnose_filtered_stocks(day, held, as_of_date)
-
         if c.empty:
             return pd.DataFrame()
 
-        # 选股条件1 / 条件2
         p2s = (c["close"] - c["short_trend"]).abs() / c["short_trend"] * 100
         p2l = (c["close"] - c["longshort_line"]).abs() / c["longshort_line"] * 100
 
@@ -736,7 +725,6 @@ class Strategy(BaseStrategy):
         if c.empty:
             return pd.DataFrame()
 
-        # 向量化评分
         j_vals = c["kdj_j"].values
         c["score"] = (
             np.where(j_vals < 0, 2, np.where(j_vals < 13, 1, 0))
@@ -751,7 +739,6 @@ class Strategy(BaseStrategy):
             if c.empty:
                 return pd.DataFrame()
 
-        # 补充输出列
         _p2s = (c["close"] - c["short_trend"]).abs() / c["short_trend"] * 100
         _p2l = (c["close"] - c["longshort_line"]).abs() / c["longshort_line"] * 100
         _cond1 = (c["close"] >= c["short_trend"]) | (_p2s < 1.0)
@@ -759,115 +746,10 @@ class Strategy(BaseStrategy):
         c["current_price"] = c["close"]
         c["price_diff_ratio"] = _p2l
 
-        result = c.sort_values(
+        return c.sort_values(
             by=["score", "kdj_j", "price_diff_ratio"],
             ascending=[False, True, True],
         ).reset_index(drop=True)
-
-        # ── 实盘诊断：打印通过全部筛选的候选标的排名 ──
-        if self._enable_diagnostics and min_score is None and not result.empty:
-            ds = pd.Timestamp(as_of_date).strftime("%Y-%m-%d")
-            top_n = min(10, len(result))
-            self._diagnostics.append(
-                f"[选股诊断] 通过全部筛选的候选标的 Top{top_n}:")
-            for i, row in result.head(top_n).iterrows():
-                name = row.get("name", "")
-                h20 = row.get("high_20d", 0)
-                l20 = row.get("low_20d", 0)
-                c21 = row.get("close_prev21", 0)
-                self._diagnostics.append(
-                    f"  #{i+1} {row['ts_code']} {name}  "
-                    f"评分={row['score']:.0f}  KDJ_J={row['kdj_j']:.2f}  "
-                    f"偏离={row['price_diff_ratio']:.2f}%  "
-                    f"振幅={row.get('amplitude_20d', 0):.4f}"
-                    f"(H={h20:.2f}/L={l20:.2f}/基准C={c21:.2f})  "
-                    f"量价={row.get('vol_pattern_15d', 0):.0f}")
-
-        return result
-
-    def _diagnose_filtered_stocks(
-        self,
-        day: pd.DataFrame,
-        held: set[str],
-        as_of_date: pd.Timestamp,
-    ) -> None:
-        """实盘诊断：先过趋势+KDJ基本条件，再评分，展示被次级条件淘汰的高分股。"""
-        # 第一步：与 _rank_candidates 的 mask 一致，先过趋势和 KDJ 基本条件
-        base_mask = (
-            (~day["ts_code"].isin(held))
-            & (day["short_trend"].notna())
-            & (day["longshort_line"].notna())
-            & (day["kdj_j"].notna())
-            & (day["short_trend"] > day["longshort_line"])
-            & (day["kdj_j"] < self.kdj_j_threshold)
-            & (day["circ_mv"].notna())
-            & (day["circ_mv"] >= self.min_circulating_cap)
-        )
-        candidates = day.loc[base_mask].copy()
-        if candidates.empty:
-            self._diagnostics.append("[选股诊断] 当日无满足趋势+KDJ基本条件的非持仓股")
-            return
-
-        # 第二步：评分（与 _rank_candidates 完全一致）
-        j_vals = candidates["kdj_j"].values
-        candidates["_diag_score"] = (
-            np.where(j_vals < 0, 2, np.where(j_vals < 13, 1, 0))
-            + candidates["has_golden_cross_20d"].fillna(False).astype(int).values * 2
-            + candidates["has_burst_20d"].fillna(False).astype(int).values * 2
-            + candidates["has_vol_shrink_40d"].fillna(False).astype(int).values
-        )
-
-        high_score = candidates.loc[candidates["_diag_score"] >= self.buy_score_threshold].copy()
-        if high_score.empty:
-            self._diagnostics.append(
-                f"[选股诊断] 趋势+KDJ通过后无评分>={self.buy_score_threshold}的股票")
-            return
-
-        self._diagnostics.append(
-            f"[选股诊断] 趋势+KDJ通过且评分>={self.buy_score_threshold}分共 {len(high_score)} 只"
-            f"（以下仅检查振幅/量价/价格条件）:")
-
-        for _, row in high_score.sort_values(
-            ["_diag_score", "kdj_j"], ascending=[False, True]
-        ).head(20).iterrows():
-            ts_code = row["ts_code"]
-            name = row.get("name", "")
-            score = row["_diag_score"]
-            kj = row["kdj_j"]
-            reasons: list[str] = []
-
-            amp = row.get("amplitude_20d", 0)
-            if amp > 0.40:
-                h20 = row.get("high_20d", None)
-                l20 = row.get("low_20d", None)
-                c21 = row.get("close_prev21", None)
-                if h20 is not None and l20 is not None and not pd.isna(h20) and not pd.isna(l20):
-                    c21_str = f", 基准C={c21:.2f}" if c21 is not None and not pd.isna(c21) else ""
-                    reasons.append(
-                        f"振幅{amp:.4f}>0.40 (20d_H={h20:.2f}, 20d_L={l20:.2f}{c21_str})")
-                else:
-                    reasons.append(f"振幅{amp:.4f}>0.40")
-
-            vp = row.get("vol_pattern_15d", 0)
-            if vp < 10:
-                reasons.append(f"量价模式{vp:.0f}<10")
-
-            close = row.get("close", 0)
-            st = row["short_trend"]
-            ls = row["longshort_line"]
-            p2s = abs(close - st) / st * 100 if st > 0 else 999
-            p2l = abs(close - ls) / ls * 100 if ls > 0 else 999
-            cond1 = close >= st or p2s < 1.0
-            cond2 = close < st and close > ls and p2l < self.price_diff_threshold
-            if not cond1 and not cond2:
-                reasons.append(f"价格条件不满足(偏离小弟{p2s:.1f}%/偏离大哥{p2l:.1f}%)")
-
-            if reasons:
-                self._diagnostics.append(
-                    f"  ✗ {ts_code} {name} 评分{score:.0f} KDJ_J={kj:.2f} → 被淘汰: {'; '.join(reasons)}")
-            else:
-                self._diagnostics.append(
-                    f"  ✓ {ts_code} {name} 评分{score:.0f} KDJ_J={kj:.2f} 振幅={amp:.4f} → 通过")
 
     def _rank_fallback_candidates(
         self,
@@ -925,7 +807,7 @@ class Strategy(BaseStrategy):
         oamv_regime: str,
     ) -> int:
         replaced = 0
-        if oamv_regime in self.force_full_regimes and not self._skip_score_replace:
+        if oamv_regime in self.force_full_regimes:
             replaced += self._replace_losing_non_top_score_holdings(
                 prepared, trade_date, holdings, sell_reasons, buy_prices,
             )
@@ -1196,6 +1078,263 @@ class Strategy(BaseStrategy):
             return None
         return self._trade_dates_list[idx - 1]
 
+    # ─────────────────────── 牛熊择时逻辑 ───────────────────────
+
+    def _fetch_and_build_market_regime(self, trade_index: pd.DatetimeIndex) -> pd.Series:
+        """通过 idx_factor_pro 获取上证指数技术指标，构建牛熊市场状态序列。
+
+        熊市条件：上证指数日线收盘价 < 250日均线 且 当周最后一个交易日 MACD_DIF < 0
+        牛市条件：上证指数日线收盘价 > 250日均线 且 当周最后一个交易日 MACD_DIF > 0
+        """
+        start_str = (trade_index.min() - pd.Timedelta(days=60)).strftime("%Y%m%d")
+        end_str = trade_index.max().strftime("%Y%m%d")
+
+        idx_data = self._tushare.get_idx_factor_pro(
+            self.SH_INDEX_CODE, start_str, end_str,
+            fields="ts_code,trade_date,close,ma_bfq_250,macd_dif_bfq",
+        )
+        if idx_data.empty:
+            return pd.Series("牛市", index=trade_index, dtype="object")
+
+        for col in ("close", "ma_bfq_250", "macd_dif_bfq"):
+            if col in idx_data.columns:
+                idx_data[col] = pd.to_numeric(idx_data[col], errors="coerce")
+        idx_data["trade_date"] = pd.to_datetime(idx_data["trade_date"])
+        idx_data = idx_data.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date")
+
+        idx_lookup: dict[pd.Timestamp, dict] = {}
+        for _, row in idx_data.iterrows():
+            td = pd.Timestamp(row["trade_date"]).normalize()
+            idx_lookup[td] = {
+                "close": row.get("close"),
+                "ma_bfq_250": row.get("ma_bfq_250"),
+                "macd_dif_bfq": row.get("macd_dif_bfq"),
+            }
+
+        all_idx_dates = sorted(idx_lookup.keys())
+
+        week_groups: dict = {}
+        for d in all_idx_dates:
+            wk = d.to_period("W")
+            if wk not in week_groups:
+                week_groups[wk] = []
+            week_groups[wk].append(d)
+        week_end_dates = {max(dates) for dates in week_groups.values()}
+
+        current_regime = "牛市"
+        regime_map: dict[pd.Timestamp, str] = {}
+
+        for d in all_idx_dates:
+            data = idx_lookup[d]
+            close = data.get("close")
+            ma250 = data.get("ma_bfq_250")
+            macd_dif = data.get("macd_dif_bfq")
+            if (
+                d in week_end_dates
+                and pd.notna(close)
+                and pd.notna(ma250)
+                and pd.notna(macd_dif)
+            ):
+                if float(close) < float(ma250) and float(macd_dif) < 0:
+                    current_regime = "熊市"
+                elif float(close) > float(ma250) and float(macd_dif) > 0:
+                    current_regime = "牛市"
+
+            regime_map[d] = current_regime
+
+        self._idx_factor_lookup = idx_lookup
+
+        regimes = [
+            regime_map.get(pd.Timestamp(d).normalize(), "牛市")
+            for d in trade_index
+        ]
+        return pd.Series(regimes, index=trade_index, dtype="object")
+
+    def _get_market_regime(self, trade_date: pd.Timestamp) -> str:
+        if not hasattr(self, "_market_regime"):
+            return "牛市"
+        return str(self._market_regime.get(pd.Timestamp(trade_date), "牛市"))
+
+    def _handle_bull_to_bear_transition(
+        self,
+        trade_date: pd.Timestamp,
+        holdings: dict[str, dict],
+        sell_reasons: dict[str, str],
+        sell_prices: dict[str, float],
+    ) -> None:
+        """牛转熊：卖出全部股票持仓，转为持有国债ETF。"""
+        for ts_code in list(holdings.keys()):
+            key = f"{ts_code}|{trade_date.strftime('%Y-%m-%d')}"
+            sell_reasons[key] = f"牛转熊-清仓转入{self.BEAR_STOCK_NAME}"
+            price = self._get_current_price(ts_code, trade_date)
+            if price is not None:
+                sell_prices[key] = price
+            holdings.pop(ts_code, None)
+            self._chips_cache.pop(ts_code, None)
+            self._chips_fetched_end.pop(ts_code, None)
+            self._chips_missing_attempts.pop(ts_code, None)
+
+    def _handle_bear_to_bull_transition(
+        self,
+        trade_date: pd.Timestamp,
+        holdings: dict[str, dict],
+        sell_reasons: dict[str, str],
+        sell_prices: dict[str, float],
+        buy_prices: dict[str, float],
+    ) -> None:
+        """熊转牛：卖出国债ETF，恢复正常股票交易。"""
+        if self._bear_stock_holding and self._bear_stock_holding["weight"] > self.BEAR_STOCK_MIN_WEIGHT:
+            key = f"{self.BEAR_STOCK_CODE}|{trade_date.strftime('%Y-%m-%d')}"
+            sell_reasons[key] = f"熊转牛-卖出{self.BEAR_STOCK_NAME}恢复股票交易"
+            bp = self._get_bear_stock_price(trade_date)
+            if bp is not None:
+                sell_prices[key] = bp
+            self._bear_stock_holding = None
+
+    def _check_bear_stock_buy(
+        self,
+        trade_date: pd.Timestamp,
+        buy_prices: dict[str, float],
+    ) -> None:
+        """熊市阶段：KDJ J值 < BEAR_KDJ_BUY_J 时买入国债ETF（全仓或半仓补回）。"""
+        if (
+            self._bear_stock_last_reduce_signal_date is not None
+            and pd.Timestamp(self._bear_stock_last_reduce_signal_date) == pd.Timestamp(trade_date)
+        ):
+            return
+
+        bear_j = self._get_bear_stock_kdj_j(trade_date)
+        if bear_j is None or bear_j >= self.BEAR_KDJ_BUY_J:
+            return
+
+        current_weight = self._bear_stock_holding["weight"] if self._bear_stock_holding else 0.0
+
+        if current_weight >= self.BEAR_STOCK_POSITION - 0.001:
+            return
+
+        execution_date, execution_price = self._get_buy_execution(
+            self.BEAR_STOCK_CODE, trade_date,
+        )
+        if execution_date is None or execution_price is None or execution_price <= 0:
+            return
+
+        buy_key = f"{self.BEAR_STOCK_CODE}|{trade_date.strftime('%Y-%m-%d')}"
+        if current_weight > self.BEAR_STOCK_MIN_WEIGHT:
+            self._bear_stock_holding["weight"] = self.BEAR_STOCK_POSITION
+            self._bear_stock_holding["last_action"] = "buy_back"
+        else:
+            self._bear_stock_holding = {
+                "buy_price": execution_price,
+                "weight": self.BEAR_STOCK_POSITION,
+                "buy_date": execution_date,
+                "last_action": "init_buy",
+            }
+        buy_prices[buy_key] = execution_price
+
+    def _fetch_bear_etf_data(self, trade_index: pd.DatetimeIndex) -> pd.DataFrame | None:
+        start_str = trade_index.min().strftime("%Y%m%d")
+        end_str = trade_index.max().strftime("%Y%m%d")
+        try:
+            df = self._tushare.get_fund_daily(self.BEAR_STOCK_CODE, start_str, end_str)
+        except Exception as exc:
+            self._warnings.append(f"获取{self.BEAR_STOCK_NAME}行情失败: {exc}")
+            return None
+        if df is None or df.empty:
+            self._warnings.append(f"未获取到{self.BEAR_STOCK_NAME}行情数据")
+            return None
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+        df["ts_code"] = self.BEAR_STOCK_CODE
+        for col in ("open", "high", "low", "close", "vol"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.sort_values("trade_date").reset_index(drop=True)
+        low_n = df["low"].rolling(9, min_periods=1).min()
+        high_n = df["high"].rolling(9, min_periods=1).max()
+        denom = (high_n - low_n).replace(0.0, pd.NA)
+        rsv = ((df["close"] - low_n) / denom * 100).fillna(0.0)
+        k = rsv.ewm(com=2, adjust=False).mean()
+        d = k.ewm(com=2, adjust=False).mean()
+        df["bear_kdj_j"] = 3 * k - 2 * d
+        return df
+
+    def _check_bear_stock_stop_loss(
+        self,
+        trade_date: pd.Timestamp,
+        sell_reasons: dict[str, str],
+        sell_prices: dict[str, float],
+    ) -> bool:
+        if (
+            not self._bear_stock_holding
+            or self._bear_stock_holding["weight"] <= self.BEAR_STOCK_MIN_WEIGHT
+        ):
+            return False
+        stock_data = self._stock_groups.get(self.BEAR_STOCK_CODE)
+        if stock_data is None or stock_data.empty:
+            return False
+        if "longshort_line" not in stock_data.columns:
+            return False
+        recent = stock_data.loc[stock_data["trade_date"] <= trade_date]
+        if len(recent) < 2 or not self._hit_stop_loss(recent):
+            return False
+        key = f"{self.BEAR_STOCK_CODE}|{trade_date.strftime('%Y-%m-%d')}"
+        sell_reasons[key] = f"止损-{self.BEAR_STOCK_NAME}跌破大哥线及近期低点"
+        stop_price = self._get_bear_stock_price(trade_date)
+        if stop_price is not None:
+            sell_prices[key] = stop_price
+        self._bear_stock_last_reduce_signal_date = pd.Timestamp(trade_date)
+        self._bear_stock_holding = None
+        return True
+
+    def _check_bear_stock_kdj_sell_half(
+        self,
+        trade_date: pd.Timestamp,
+        sell_reasons: dict[str, str],
+        sell_prices: dict[str, float],
+    ) -> bool:
+        """KDJ J值 > BEAR_KDJ_SELL_J 时卖出一半国债ETF仓位。"""
+        if (
+            not self._bear_stock_holding
+            or self._bear_stock_holding["weight"] <= self.BEAR_STOCK_HALF_POSITION + 0.001
+        ):
+            return False
+
+        bear_j = self._get_bear_stock_kdj_j(trade_date)
+        if bear_j is None or bear_j <= self.BEAR_KDJ_SELL_J:
+            return False
+
+        key = f"{self.BEAR_STOCK_CODE}|{trade_date.strftime('%Y-%m-%d')}"
+        sell_reasons[key] = f"KDJ减仓-{self.BEAR_STOCK_NAME} J值({bear_j:.1f})>{self.BEAR_KDJ_SELL_J}卖出一半"
+        sell_price = self._get_bear_stock_price(trade_date)
+        if sell_price is not None:
+            sell_prices[key] = sell_price
+        self._bear_stock_holding["weight"] = self.BEAR_STOCK_HALF_POSITION
+        self._bear_stock_holding["last_action"] = "sell_half"
+        return True
+
+    def _get_bear_stock_kdj_j(self, trade_date: pd.Timestamp) -> float | None:
+        if self._bear_etf_data is None or self._bear_etf_data.empty:
+            return None
+        if "bear_kdj_j" not in self._bear_etf_data.columns:
+            return None
+        row = self._bear_etf_data.loc[self._bear_etf_data["trade_date"] == trade_date]
+        if row.empty:
+            return None
+        val = row.iloc[-1]["bear_kdj_j"]
+        return float(val) if pd.notna(val) else None
+
+    def _get_bear_stock_next_open(
+        self, trade_date: pd.Timestamp,
+    ) -> tuple[pd.Timestamp | None, float | None]:
+        return self._get_next_open_execution(self.BEAR_STOCK_CODE, trade_date)
+
+    def _get_bear_stock_price(self, trade_date: pd.Timestamp) -> float | None:
+        if self._live_execution_mode:
+            rt = self._realtime_prices.get(self.BEAR_STOCK_CODE, {})
+            price = rt.get("latest_price", 0.0)
+            if price > 0:
+                return price
+        return self._get_current_price(self.BEAR_STOCK_CODE, trade_date)
+
     # ─────────────────────── 筹码数据 ───────────────────────
 
     _CHIPS_CHUNK_TRADING_DAYS = 50
@@ -1414,10 +1553,7 @@ class Strategy(BaseStrategy):
 
         if self._live_execution_mode:
             live_events = self._compute_oamv_live_events()
-            # 自动计算的事件作为底层，手工标注事件优先覆盖
-            merged = dict(live_events)
-            merged.update(event_map)
-            event_map = merged
+            event_map.update(live_events)
 
         return event_map
 
@@ -1453,33 +1589,6 @@ class Strategy(BaseStrategy):
         pending_dead_idx: int | None = None
 
         normalized_dates = [pd.Timestamp(day).normalize() for day in trade_index]
-
-        # 回溯回测起始日之前的事件，确定初始状态
-        if normalized_dates:
-            start_date = normalized_dates[0]
-            prior_events = sorted(
-                ((d, s) for d, s in event_map.items() if d < start_date),
-                key=lambda x: x[0],
-            )
-            for ev_date, status in prior_events:
-                if status == "金叉":
-                    current_state = "金叉"
-                    in_golden_cross = True
-                elif status == "死叉":
-                    current_state = "死叉"
-                    in_golden_cross = False
-                elif status == "大涨":
-                    if in_golden_cross:
-                        current_state = "金叉"
-                    else:
-                        current_state = "大涨"
-            # 非金叉区间的大涨有窗口限制：用自然日估算是否已过期
-            # oamv_big_rise_window 个交易日 ≈ 窗口天数 * 1.5 的自然日
-            if current_state == "大涨" and prior_events:
-                last_ev_date = prior_events[-1][0]
-                calendar_days = (start_date - last_ev_date).days
-                if calendar_days > self.oamv_big_rise_window * 1.5:
-                    current_state = "死叉"
         for idx, trade_date in enumerate(normalized_dates):
             event_status = event_map.get(trade_date)
             if event_status == "金叉":
@@ -1569,7 +1678,6 @@ class Strategy(BaseStrategy):
         fallback_map: dict[tuple[str, pd.Timestamp], float] = {}
         for row in frame.itertuples(index=False):
             ratio = float(row.profit_ratio)
-            # Excel 中若使用 0~1 小数表示比例，则转换为 0~100 口径。
             if ratio <= 1.5:
                 ratio *= 100.0
             fallback_map[(str(row.ts_code), pd.Timestamp(row.trade_date))] = ratio

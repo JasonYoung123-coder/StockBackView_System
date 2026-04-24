@@ -15,6 +15,7 @@ import pandas as pd
 
 from app.core.config import get_settings
 from app.services.market_data_service import MarketDataService
+from app.services.trading_calendar import TradingCalendarError, get_calendar
 from app.services.tushare_client import TushareClient
 from app.strategy.loader import StrategyLoader
 from app.trading.models import AccountInfo, OrderItem, PositionItem
@@ -27,7 +28,7 @@ SELL_EXECUTION_TIME = (14, 53)
 SELL_DEADLINE = (14, 59)
 SELL_SIGNAL_TIME = (21, 10)
 SELL_SIGNAL_DEADLINE = (21, 20)
-BUY_SIGNAL_TIME = (21, 25)
+BUY_SIGNAL_TIME = (21, 30)
 BUY_SIGNAL_DEADLINE = (21, 35)
 OAMV_FETCH_TIME = (15, 5)
 OAMV_DEADLINE = (15, 15)
@@ -45,6 +46,7 @@ ORDER_RETRY_INTERVAL = 5
 SELL_MAX_RETRIES = 24
 BUY_MAX_RETRIES = 60
 MAX_MEMORY_LOG_LINES = 500
+PENDING_EXPIRE_TRADING_DAYS = 3
 LOG_DIR = Path(__file__).resolve().parents[2] / "data" / "logs"
 
 
@@ -254,8 +256,28 @@ class TradingScheduler:
 
     def _add_adopted_position(self, ts_code: str, name: str,
                               buy_date: str, buy_price: float,
-                              source: str = "manual") -> None:
-        """将买入的股票加入持仓注册表（策略买入或手动买入均记录）。"""
+                              source: str = "manual",
+                              score: float = 7.0) -> None:
+        """将买入的股票加入持仓注册表（策略买入或手动买入均记录）。
+
+        score：注入策略时的评分。>= buy_score_threshold(7) 时不会被
+        "7 分新股替换亏损低分股" 逻辑命中。默认 7，相当于"受保护"。
+        手动买入若想让其参与替换，可在 JSON 里改成更低的分数。
+        """
+        # 双保险:确保 buy_date 一定是交易日,避免持股天数计算偏移
+        try:
+            buy_date_obj = datetime.date.fromisoformat(buy_date)
+            cal = get_calendar()
+            if not cal.is_trading_day(buy_date_obj):
+                normalized = cal.previous_trading_day(buy_date_obj)
+                self._log(
+                    f"[警告] {ts_code} buy_date={buy_date} 非交易日,"
+                    f"已归整为前一交易日 {normalized.isoformat()}"
+                )
+                buy_date = normalized.isoformat()
+        except (ValueError, TradingCalendarError) as exc:
+            self._log(f"[警告] buy_date 校验跳过 ({exc})")
+
         adopted = self._load_adopted_positions()
         adopted[ts_code] = {
             "ts_code": ts_code,
@@ -263,10 +285,12 @@ class TradingScheduler:
             "buy_date": buy_date,
             "buy_price": round(buy_price, 3),
             "source": source,
+            "score": float(score),
         }
         self._save_adopted_positions(adopted)
         self._log(f"  已加入持仓注册表: {ts_code} {name} "
-                  f"买入日={buy_date} 买入价={buy_price:.2f} 来源={source}")
+                  f"买入日={buy_date} 买入价={buy_price:.2f} "
+                  f"评分={score:.0f} 来源={source}")
 
     # ──────────────────────────────────────────────
 
@@ -299,6 +323,15 @@ class TradingScheduler:
                 return
             self._state = SchedulerState(running=True, config=config)
             self._stop_event.clear()
+
+        try:
+            get_calendar().refresh()
+        except TradingCalendarError as exc:
+            with self._lock:
+                self._state.running = False
+                self._state.error = f"交易日历不可用: {exc}"
+            self._log(f"[错误] 交易日历加载失败,调度拒绝启动: {exc}")
+            return
 
         self._load_pending_signals()
 
@@ -337,7 +370,13 @@ class TradingScheduler:
     def _tick(self) -> None:
         now = datetime.datetime.now()
 
-        if now.weekday() not in WEEKDAYS:
+        try:
+            is_trading = get_calendar().is_trading_day(now.date())
+        except TradingCalendarError as exc:
+            self._log(f"[警告] 交易日历不可用,回退为周末判断: {exc}")
+            is_trading = now.weekday() in WEEKDAYS
+
+        if not is_trading:
             self._update_next_execution(now, skip_today=True)
             return
 
@@ -499,8 +538,14 @@ class TradingScheduler:
         target_date = now.date()
         if skip_today or hm >= BUY_SIGNAL_DEADLINE:
             target_date += datetime.timedelta(days=1)
-        while target_date.weekday() not in WEEKDAYS:
-            target_date += datetime.timedelta(days=1)
+        try:
+            cal = get_calendar()
+            if not cal.is_trading_day(target_date):
+                # 找到 target_date 当天或之后的第一个交易日
+                target_date = cal.next_trading_day(target_date - datetime.timedelta(days=1))
+        except TradingCalendarError:
+            while target_date.weekday() not in WEEKDAYS:
+                target_date += datetime.timedelta(days=1)
 
         if has_pending_sells and not sells_exec_done:
             next_time = datetime.time(*SELL_PHASE1_TIME)
@@ -1136,9 +1181,6 @@ class TradingScheduler:
             if pending:
                 with self._lock:
                     self._state.pending_buy_signals = pending
-                    self._state.strategy_target_holdings = strategy_target
-                    self._state.strategy_holding_codes = list(strategy_codes)
-                self._save_pending_signals()
                 self._log(f"已生成 {len(pending)} 只待买入标的，将于下一交易日 9:26 委托")
                 for p in pending:
                     self._log(f"  待买入: {p['ts_code']} {p['name']}")
@@ -1151,6 +1193,13 @@ class TradingScheduler:
             self._notify_no_buy_signal(
                 len(strategy_holdings), strategy_target, strategy_warnings,
             )
+
+        # 无论是否产生待买入信号，都更新策略目标持仓快照并落盘，
+        # 保证 pending_signals.json 中的 strategy_holding_codes 始终反映最新状态
+        with self._lock:
+            self._state.strategy_target_holdings = strategy_target
+            self._state.strategy_holding_codes = list(strategy_codes)
+        self._save_pending_signals()
 
         # ── 合并手动买入信号（不受仓位上限约束） ──
         manual_buys = self._consume_manual_buys()
@@ -1182,8 +1231,56 @@ class TradingScheduler:
 
     # ────────────── T+1 早盘待卖出执行 ──────────────
 
+    def _expire_pending_if_stale(
+        self, now: datetime.datetime, kind: str,
+    ) -> bool:
+        """检测待执行信号是否已超过 PENDING_EXPIRE_TRADING_DAYS 个交易日。
+
+        返回 True 表示已清空,调用方应直接 return。
+        """
+        gen_attr = "last_sell_signal_gen" if kind == "sell" else "last_buy_signal_gen"
+        pending_attr = "pending_sell_signals" if kind == "sell" else "pending_buy_signals"
+        exec_attr = "sell_signal_execution_date" if kind == "sell" else "buy_execution_date"
+
+        gen_str = getattr(self._state, gen_attr, "") or ""
+        if len(gen_str) < 10:
+            return False
+        try:
+            gen_date = datetime.date.fromisoformat(gen_str[:10])
+        except ValueError:
+            return False
+        today = now.date()
+        if gen_date >= today:
+            return False
+
+        try:
+            cal = get_calendar()
+            age = 0
+            cur = cal.next_trading_day(gen_date)
+            while cur < today:
+                age += 1
+                cur = cal.next_trading_day(cur)
+        except TradingCalendarError:
+            return False
+
+        if age <= PENDING_EXPIRE_TRADING_DAYS:
+            return False
+
+        kind_cn = "卖出" if kind == "sell" else "买入"
+        self._log(
+            f"[警告] 待{kind_cn}信号生成于 {gen_date.isoformat()},"
+            f"已超过 {PENDING_EXPIRE_TRADING_DAYS} 个交易日未执行,主动清空以防旧信号误下单"
+        )
+        with self._lock:
+            getattr(self._state, pending_attr).clear()
+            setattr(self._state, exec_attr, today.strftime("%Y-%m-%d"))
+        self._save_pending_signals()
+        return True
+
     def _execute_pending_sells(self, now: datetime.datetime) -> None:
         """T+1 早盘执行待卖出：9:26 首次委托 → 等待至 9:30 → 撤单重委，与买入逻辑对称。"""
+        if self._expire_pending_if_stale(now, "sell"):
+            return
         with self._lock:
             pending = list(self._state.pending_sell_signals)
             config = self._state.config
@@ -1396,6 +1493,8 @@ class TradingScheduler:
 
     def _execute_pending_buys(self, now: datetime.datetime) -> None:
         """T+1 早盘执行待买入：9:26 首次委托 → 等待至 9:30 → 撤单重委 → 5 秒轮询。"""
+        if self._expire_pending_if_stale(now, "buy"):
+            return
         with self._lock:
             pending = list(self._state.pending_buy_signals)
             config = self._state.config

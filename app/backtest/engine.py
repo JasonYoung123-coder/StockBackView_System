@@ -46,6 +46,12 @@ class BacktestEngine:
         target_weights.index = pd.to_datetime(target_weights.index)
         target_weights = target_weights.sort_index().fillna(0.0)
 
+        supplementary = strategy_meta.get("supplementary_market_data")
+        if supplementary is not None and isinstance(supplementary, pd.DataFrame) and not supplementary.empty:
+            supplementary = supplementary.copy()
+            supplementary["trade_date"] = pd.to_datetime(supplementary["trade_date"])
+            prepared_market = pd.concat([prepared_market, supplementary], ignore_index=True)
+
         close_matrix = (
             prepared_market.pivot_table(index="trade_date", columns="ts_code", values="close", aggfunc="last")
             .sort_index().ffill()

@@ -140,3 +140,37 @@ class BacktestJobStatusResponse(BaseModel):
     message: str
     result: Optional[BacktestResponse] = None
     error: Optional[str] = None
+
+
+class BacktestRecordSummary(BaseModel):
+    record_id: str
+    saved_at: str
+    strategy_name: str
+    asset: str = ""
+    start_date: str
+    end_date: str
+    initial_capital: float = 0
+    metrics: dict[str, MetricSummary] = {}
+    strategy_params: dict[str, Any] = {}
+
+
+class BacktestRecordFull(BaseModel):
+    record_id: str
+    saved_at: str
+    request: BacktestRequest
+    result: BacktestResponse
+
+
+class ComparisonRequest(BaseModel):
+    record_ids: list[str] = Field(..., min_length=2, max_length=10)
+
+
+class ComparisonCurve(BaseModel):
+    record_id: str
+    label: str
+    points: list[CurvePoint]
+
+
+class ComparisonResponse(BaseModel):
+    curves: list[ComparisonCurve]
+    date_range: dict[str, str]
